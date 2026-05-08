@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.5.0
+// @version      1.6.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -32,6 +32,9 @@
   let fab = null;
   let uiReady = false;
   let metaCache = null; // cached episode metadata for this page
+  let seasonActive = false;
+  let seasonStop = false;
+  let seasonCount = 0;
 
   // Report a found VTT — bubble up from iframes to the top frame's UI
   function reportVtt(url, source, extra) {
@@ -514,6 +517,15 @@
     .vdp-btn.done { border-color: #22c55e !important; color: #22c55e !important; }
     .vdp-btn.busy { border-color: #f59e0b !important; color: #f59e0b !important; cursor: default !important; }
     .vdp-btn.err  { border-color: #ef4444 !important; color: #ef4444 !important; }
+
+    .vdp-dl-season { all: initial !important; background: transparent !important; border: 1px solid #a855f7 !important; color: #a855f7 !important; border-radius: 6px !important; padding: 4px 9px !important; font-size: 11px !important; font-weight: 600 !important; cursor: pointer !important; font-family: inherit !important; margin-right: 6px !important; transition: background 0.1s !important; }
+    .vdp-dl-season:hover:not(:disabled) { background: #a855f7 !important; color: #fff !important; }
+    .vdp-dl-season:disabled { opacity: 0.4 !important; cursor: default !important; }
+    .vdp-dl-season.active { background: #a855f7 !important; color: #fff !important; }
+
+    .vdp-banner { padding: 7px 14px !important; background: #1e1b4b !important; border-bottom: 1px solid #4338ca !important; font-size: 11px !important; color: #c7d2fe !important; display: none !important; }
+    .vdp-banner.visible { display: block !important; }
+    .vdp-banner b { color: #fff !important; }
   `);
 
   // ── UI ─────────────────────────────────────────────────────────────────────
@@ -536,8 +548,12 @@
       </div>
       <div class="vdp-toolbar">
         <span class="vdp-count" id="vtt-dl-count">Scanning…</span>
-        <button class="vdp-dl-all" id="vtt-dl-all" disabled>Download All</button>
+        <div>
+          <button class="vdp-dl-season" id="vtt-dl-season" disabled title="Download every episode in this season automatically">Season ▶</button>
+          <button class="vdp-dl-all" id="vtt-dl-all" disabled>Download All</button>
+        </div>
       </div>
+      <div class="vdp-banner" id="vtt-dl-banner"></div>
       <div class="vdp-list" id="vtt-dl-list"></div>
     `;
     document.documentElement.appendChild(panel);
@@ -552,6 +568,8 @@
         setTimeout(() => triggerItemDownload(item), i * 400);
       });
     });
+
+    document.getElementById("vtt-dl-season").addEventListener("click", toggleSeasonDownload);
 
     uiReady = true;
     updateUI();
@@ -574,6 +592,12 @@
     const dlAll   = document.getElementById("vtt-dl-all");
     if (countEl) countEl.textContent = count > 0 ? `${count} VTT file${count !== 1 ? "s" : ""} found` : "No VTT files yet";
     if (dlAll)   dlAll.disabled = count === 0;
+    const dlSeason = document.getElementById("vtt-dl-season");
+    if (dlSeason) {
+      dlSeason.disabled = count === 0 && !seasonActive;
+      dlSeason.classList.toggle("active", seasonActive);
+      dlSeason.textContent = seasonActive ? "Stop ⏹" : "Season ▶";
+    }
 
     const list = document.getElementById("vtt-dl-list");
     if (!list) return;
@@ -749,6 +773,210 @@
     a.click();
     document.body.removeChild(a);
     if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); }
+  }
+
+  // ── Season auto-download ───────────────────────────────────────────────────
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function setBanner(html) {
+    const b = document.getElementById("vtt-dl-banner");
+    if (!b) return;
+    if (!html) { b.classList.remove("visible"); b.innerHTML = ""; return; }
+    b.innerHTML = html;
+    b.classList.add("visible");
+  }
+
+  // Pick the "best" VTT entry: prefer English [CC], then English, then any HLS, then first.
+  function pickPreferredEntry(entries, preferLabel) {
+    if (entries.length === 0) return null;
+    const lc = (preferLabel || "").toLowerCase();
+    if (preferLabel) {
+      const exact = entries.find((e) => (e.hlsLabel || e.trackLabel || "").toLowerCase() === lc);
+      if (exact) return exact;
+      const partial = entries.find((e) => (e.hlsLabel || e.trackLabel || "").toLowerCase().includes(lc));
+      if (partial) return partial;
+    }
+    return (
+      entries.find((e) => /english.*\[cc\]/i.test(e.hlsLabel || e.trackLabel || "")) ||
+      entries.find((e) => /english/i.test(e.hlsLabel || e.trackLabel || "")) ||
+      entries.find((e) => e.isHls) ||
+      entries[0]
+    );
+  }
+
+  // Try a list of selectors / strategies to find Crunchyroll's "next episode" trigger.
+  function findNextEpisodeTarget() {
+    const selectors = [
+      '[data-t="next-episode-button"]',
+      '[data-testid="next-episode-button"]',
+      '[data-testid="next-episode"]',
+      'button[aria-label*="Next Episode" i]',
+      'a[aria-label*="Next Episode" i]',
+      'button[aria-label*="Next" i][aria-label*="episode" i]',
+      'a[aria-label*="Next" i][aria-label*="episode" i]',
+      '[class*="next-episode" i] a',
+      '[class*="next-episode" i] button',
+      '[class*="NextEpisode" i] a',
+      '[class*="NextEpisode" i] button',
+      '.up-next-section a',
+      '[data-t="up-next"] a',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && (el.offsetParent !== null || el.tagName === "A")) return el;
+    }
+
+    // Fallback: find the currently-playing episode card and grab the next sibling's link.
+    const currentSelectors = [
+      '[data-t="current-episode"]',
+      '[aria-current="true"]',
+      '[aria-current="page"]',
+      '.current-episode',
+      '.is-current',
+    ];
+    for (const sel of currentSelectors) {
+      const cur = document.querySelector(sel);
+      if (!cur) continue;
+      const sib = cur.nextElementSibling;
+      if (sib) {
+        const link = sib.matches("a") ? sib : sib.querySelector("a[href*='/watch/']");
+        if (link) return link;
+      }
+    }
+
+    return null;
+  }
+
+  async function waitForUrlChange(oldUrl, timeoutMs) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (location.href !== oldUrl) return true;
+      await sleep(300);
+    }
+    return false;
+  }
+
+  async function waitForVttEntries(timeoutMs) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (seasonStop) return null;
+      if (foundVtts.size > 0 && getEpisodeMetadata()) {
+        // Give a brief grace period for additional language tracks to arrive
+        await sleep(800);
+        return [...foundVtts.values()];
+      }
+      await sleep(500);
+    }
+    return foundVtts.size > 0 ? [...foundVtts.values()] : null;
+  }
+
+  async function tryAutoplay() {
+    // If autoplay is blocked, click the play button so the player loads subtitles.
+    const playSelectors = [
+      'button[aria-label*="Play" i][aria-label*="video" i]',
+      'button[data-t="play-button"]',
+      'button[aria-label="Play"]',
+      '.vjs-big-play-button',
+      'button.player-play-button',
+    ];
+    for (const sel of playSelectors) {
+      const el = document.querySelector(sel);
+      if (el && el.offsetParent !== null && !el.disabled) {
+        try { el.click(); return true; } catch {}
+      }
+    }
+    return false;
+  }
+
+  // Wait for the current download to feasibly finish before navigating away.
+  async function downloadAndWait(entry) {
+    const filename = buildFilename(entry);
+    const fakeBtn = { textContent: "", classList: { add: () => {}, remove: () => {} } };
+    if (entry.isHls)       await downloadHls({ ...entry, filename }, fakeBtn);
+    else if (entry.isBlob) downloadBlobVtt({ ...entry, filename }, fakeBtn);
+    else                   await downloadDirect(entry.url, filename, fakeBtn);
+    await sleep(1500); // let the browser finish writing
+  }
+
+  async function toggleSeasonDownload() {
+    if (seasonActive) {
+      seasonStop = true;
+      setBanner("⏹ Stopping after current download…");
+      return;
+    }
+
+    const initial = pickPreferredEntry([...foundVtts.values()]);
+    if (!initial) {
+      setBanner("⚠️ No VTT files detected yet. Play the video first.");
+      setTimeout(() => setBanner(""), 4000);
+      return;
+    }
+
+    const preferLabel = initial.hlsLabel || initial.trackLabel || "";
+    seasonActive = true;
+    seasonStop = false;
+    seasonCount = 0;
+    updateUI();
+
+    let next = initial;
+
+    while (next && !seasonStop) {
+      seasonCount++;
+      const meta = getEpisodeMetadata();
+      const epTitle = meta ? `${meta.series} S${String(meta.season).padStart(2, "0")}E${String(meta.episode).padStart(2, "0")}` : `Episode ${seasonCount}`;
+      setBanner(`⏳ Downloading <b>${epTitle}</b> (${preferLabel || "default track"})…`);
+
+      try {
+        await downloadAndWait(next);
+      } catch (e) {
+        setBanner(`⚠️ Download failed for ${epTitle}: ${e.message || e}`);
+        await sleep(2000);
+      }
+
+      if (seasonStop) break;
+
+      setBanner(`✅ Saved ${epTitle}. Looking for next episode…`);
+
+      const target = findNextEpisodeTarget();
+      if (!target) {
+        setBanner(`🏁 Done — no next-episode link found. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        break;
+      }
+
+      const oldUrl = location.href;
+      try { target.click(); } catch {}
+
+      const navigated = await waitForUrlChange(oldUrl, 15000);
+      if (!navigated) {
+        setBanner(`🏁 Navigation didn't happen — stopping. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        break;
+      }
+
+      // Give the page a moment to clear state
+      await sleep(2500);
+      if (seasonStop) break;
+
+      // Try autoplay if needed
+      await tryAutoplay();
+
+      setBanner(`⏳ Waiting for episode ${seasonCount + 1} subtitles to load…`);
+      const newEntries = await waitForVttEntries(45000);
+      if (!newEntries || newEntries.length === 0) {
+        setBanner(`🏁 Timed out waiting for subtitles on the next episode. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        break;
+      }
+
+      next = pickPreferredEntry(newEntries, preferLabel);
+    }
+
+    seasonActive = false;
+    seasonStop = false;
+    updateUI();
+    setTimeout(() => {
+      const banner = document.getElementById("vtt-dl-banner");
+      if (banner && !seasonActive) setTimeout(() => setBanner(""), 8000);
+    }, 100);
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
