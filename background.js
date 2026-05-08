@@ -7,7 +7,7 @@ const networkVtts = new Map();
 api.webRequest.onCompleted.addListener(
   (details) => {
     const url = details.url;
-    if (!isVttUrl(url)) return;
+    if (!isVttUrl(url) && !isVttContentType(details)) return;
 
     const tabId = details.tabId;
     if (tabId < 0) return;
@@ -20,7 +20,8 @@ api.webRequest.onCompleted.addListener(
     updateBadge(tabId);
     notifyPopup(tabId);
   },
-  { urls: ["<all_urls>"] }
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"]
 );
 
 // Also intercept requests before they complete to catch streaming VTTs
@@ -60,13 +61,23 @@ function isVttUrl(url) {
     const parsed = new URL(url);
     const path = parsed.pathname.toLowerCase();
     if (path.endsWith(".vtt")) return true;
-    // Also catch URLs with vtt in query/path for some streaming services
     const search = parsed.search.toLowerCase();
     if (search.includes("format=vtt") || search.includes("type=vtt")) return true;
     return false;
   } catch {
     return url.toLowerCase().includes(".vtt");
   }
+}
+
+function isVttContentType(details) {
+  const headers = details.responseHeaders || [];
+  for (const h of headers) {
+    if (h.name.toLowerCase() === "content-type") {
+      const v = h.value.toLowerCase();
+      return v.includes("text/vtt") || v.includes("webvtt");
+    }
+  }
+  return false;
 }
 
 function updateBadge(tabId) {
