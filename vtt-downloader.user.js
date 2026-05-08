@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.10.0
+// @version      1.11.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -391,7 +391,9 @@
     if (!meta || !meta.series || !meta.title) return false;
 
     const path = location.pathname.toLowerCase();
-    const titleWords  = significantWords(meta.title);
+    // cleanTitle strips "Season X Part X E# -" prefixes before word-matching so
+    // those prefix words don't appear as candidates against the URL slug.
+    const titleWords  = significantWords(cleanTitle(meta.title));
     const seriesWords = significantWords(meta.series);
 
     // Require at least one significant title word to appear in the URL path.
@@ -1081,6 +1083,11 @@
     seasonStop = false;
     seasonCount = 0;
     updateUI();
+
+    // Ensure the player is running so Crunchyroll renders JSON-LD and updates
+    // document.title before we try to read episode metadata for episode 1.
+    await tryAutoplay();
+    await sleep(1500);
 
     let next = initial;
 
