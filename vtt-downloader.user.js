@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.3.0
+// @version      1.4.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -30,6 +30,7 @@
   let panel = null;
   let fab = null;
   let uiReady = false;
+  let metaCache = null; // cached episode metadata for this page
 
   // Report a found VTT — bubble up from iframes to the top frame's UI
   function reportVtt(url, source, extra) {
@@ -301,10 +302,98 @@
 
   // ── DOM scanning ───────────────────────────────────────────────────────────
 
+  // ── Episode metadata & filename formatting ─────────────────────────────────
+
+  function getEpisodeMetadata() {
+    if (metaCache) return metaCache;
+
+    // 1. JSON-LD structured data — most reliable across sites
+    for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const root = JSON.parse(el.textContent);
+        const nodes = [].concat(root["@graph"] || root);
+        for (const node of nodes) {
+          if (!/TVEpisode|Episode/i.test(node["@type"] || "")) continue;
+          const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
+          const title  = (node.name || "").trim();
+          if (!series || !title) continue;
+          metaCache = {
+            series,
+            season:  parseInt(node.partOfSeason?.seasonNumber, 10) || 1,
+            episode: parseInt(node.episodeNumber, 10) || 1,
+            title,
+          };
+          return metaCache;
+        }
+      } catch {}
+    }
+
+    // 2. Page title / og:title — Crunchyroll formats:
+    //    "Watch Chainsaw Man Episode 1 - DOG & CHAINSAW | Crunchyroll"
+    //    "Chainsaw Man - DOG & CHAINSAW | Crunchyroll"
+    const candidates = [
+      document.querySelector('meta[property="og:title"]')?.content || "",
+      document.title,
+    ];
+    for (const raw of candidates) {
+      const s = raw
+        .replace(/\s*\|\s*[^|]+$/, "")  // strip trailing "| Site Name"
+        .replace(/^Watch\s+/i, "")       // strip leading "Watch "
+        .trim();
+
+      // "{Series} [Season N ]Episode N - {Title}"
+      let m = s.match(/^(.+?)\s+(?:Season\s+(\d+)\s+)?Episode\s+(\d+)\s*[-–]\s*(.+)$/i);
+      if (m) {
+        metaCache = { series: m[1].trim(), season: parseInt(m[2], 10) || 1,
+                      episode: parseInt(m[3], 10), title: m[4].trim() };
+        return metaCache;
+      }
+
+      // "{Series} - S{N}E{N} - {Title}"
+      m = s.match(/^(.+?)\s*-\s*S(\d+)\s*E(\d+)\s*[-–]\s*(.+)$/i);
+      if (m) {
+        metaCache = { series: m[1].trim(), season: parseInt(m[2], 10),
+                      episode: parseInt(m[3], 10), title: m[4].trim() };
+        return metaCache;
+      }
+    }
+
+    return null;
+  }
+
+  function sanitizeName(str) {
+    return (str || "").replace(/[/\\:*?"<>|]/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  // Build the human-readable download filename.
+  // Target format: Chainsaw Man_S01E01_DOG & CHAINSAW - English [CC].vtt
+  function buildFilename(entry) {
+    const meta = getEpisodeMetadata();
+    const lang = entry.hlsLabel || entry.trackLabel || "";
+
+    if (meta && meta.series && meta.title) {
+      const series  = sanitizeName(meta.series);
+      const season  = String(meta.season).padStart(2, "0");
+      const episode = String(meta.episode).padStart(2, "0");
+      const title   = sanitizeName(meta.title);
+      const suffix  = lang ? ` - ${sanitizeName(lang)}` : "";
+      return `${series}_S${season}E${episode}_${title}${suffix}.vtt`;
+    }
+
+    // Fallback: append language to the raw filename if we have it
+    if (lang) {
+      const base = (entry.filename || "subtitles").replace(/\.vtt$/i, "");
+      return `${sanitizeName(base)} - ${sanitizeName(lang)}.vtt`;
+    }
+
+    return entry.filename || "subtitles.vtt";
+  }
+
   function scanDOM() {
     document.querySelectorAll("track[src]").forEach((el) => {
       const url = el.src || el.getAttribute("src");
-      if (url && isVttUrl(url)) reportVtt(url, "track");
+      const trackLabel = el.label || el.getAttribute("label") || "";
+      if (url && isVttUrl(url)) reportVtt(url, "track", { trackLabel });
     });
     document.querySelectorAll("source[src]").forEach((el) => {
       const url = el.src || el.getAttribute("src");
@@ -476,7 +565,8 @@
     }
 
     for (const entry of foundVtts.values()) {
-      const { url, filename, source, isHls, isBlob } = entry;
+      const { url, source, isHls, isBlob } = entry;
+      const displayName = buildFilename(entry);
       const item = document.createElement("div");
       item.className = "vdp-item";
 
@@ -487,7 +577,7 @@
       const info = document.createElement("div");
       info.className = "vdp-info";
       info.innerHTML = `
-        <div class="vdp-name" title="${url}">${filename}</div>
+        <div class="vdp-name" title="${url}">${displayName}</div>
         <div class="vdp-src"><span class="vdp-tag ${tagClass}">${tagLabel}</span>${host}</div>
       `;
 
@@ -505,12 +595,14 @@
   // ── Download logic ─────────────────────────────────────────────────────────
 
   function triggerItemDownload(entry, btn) {
+    // Build the formatted filename at click time so page metadata is fully loaded
+    const filename = buildFilename(entry);
     if (entry.isHls) {
-      downloadHls(entry, btn);
+      downloadHls({ ...entry, filename }, btn);
     } else if (entry.isBlob) {
-      downloadBlobVtt(entry, btn);
+      downloadBlobVtt({ ...entry, filename }, btn);
     } else {
-      downloadDirect(entry.url, entry.filename, btn);
+      downloadDirect(entry.url, filename, btn);
     }
   }
 
@@ -627,6 +719,7 @@
           lastUrl = location.href;
           foundVtts.clear();
           blobVttStore.clear();
+          metaCache = null;
           setTimeout(scanDOM, 600);
           updateUI();
         }
