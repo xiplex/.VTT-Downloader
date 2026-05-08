@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.4.0
+// @version      1.5.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
@@ -365,6 +366,25 @@
     return (str || "").replace(/[/\\:*?"<>|]/g, "").replace(/\s+/g, " ").trim();
   }
 
+  // Strip leading season/episode prefixes Crunchyroll bakes into episode names.
+  // e.g. "Season 1 Part 1 E1 - Asta and Yuno" -> "Asta and Yuno"
+  //      "S1E1 - Title" -> "Title", "Episode 1: Title" -> "Title"
+  function cleanTitle(title) {
+    if (!title) return title;
+    let prev;
+    let cur = title.trim();
+    do {
+      prev = cur;
+      cur = cur
+        .replace(/^Season\s+\d+(?:\s+Part\s+\d+)?\s*[-–:|]?\s*/i, "")
+        .replace(/^Part\s+\d+\s*[-–:|]?\s*/i, "")
+        .replace(/^S\d+\s*E\d+\s*[-–:|]\s*/i, "")
+        .replace(/^E(?:pisode)?\s*\d+\s*[-–:|]\s*/i, "")
+        .trim();
+    } while (cur !== prev && cur.length > 0);
+    return cur || title.trim();
+  }
+
   // Build the human-readable download filename.
   // Target format: Chainsaw Man_S01E01_DOG & CHAINSAW - English [CC].vtt
   function buildFilename(entry) {
@@ -375,7 +395,7 @@
       const series  = sanitizeName(meta.series);
       const season  = String(meta.season).padStart(2, "0");
       const episode = String(meta.episode).padStart(2, "0");
-      const title   = sanitizeName(meta.title);
+      const title   = sanitizeName(cleanTitle(meta.title));
       const suffix  = lang ? ` - ${sanitizeName(lang)}` : "";
       return `${series}_S${season}E${episode}_${title}${suffix}.vtt`;
     }
@@ -606,17 +626,54 @@
     }
   }
 
-  function downloadDirect(url, filename, btn) {
+  // Cross-origin URLs make browsers ignore the anchor `download` attribute,
+  // so we fetch the VTT body and re-save it as a same-origin blob — that way
+  // our chosen filename is actually honored.
+  async function downloadDirect(url, filename, btn) {
+    if (btn) { btn.textContent = "⏳ Fetching…"; btn.classList.add("busy"); }
+
+    // 1. Try regular fetch (works if the page already has CORS access)
+    try {
+      const resp = await fetch(url, { credentials: "include" });
+      if (resp.ok) {
+        const text = await resp.text();
+        saveTextAsVtt(text, filename, btn);
+        return;
+      }
+    } catch {}
+
+    // 2. Try GM_xmlhttpRequest — privileged context bypasses CORS
+    if (typeof GM_xmlhttpRequest !== "undefined") {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (resp) => {
+          if (resp.status >= 200 && resp.status < 300 && resp.responseText) {
+            saveTextAsVtt(resp.responseText, filename, btn);
+          } else {
+            tryGmDownload(url, filename, btn);
+          }
+        },
+        onerror: () => tryGmDownload(url, filename, btn),
+      });
+      return;
+    }
+
+    // 3. Last resort
+    tryGmDownload(url, filename, btn);
+  }
+
+  function tryGmDownload(url, filename, btn) {
     if (typeof GM_download !== "undefined") {
       GM_download({
         url,
         name: filename,
-        onerror: () => fallbackDownload(url, filename),
+        onload: () => { if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); } },
+        onerror: () => fallbackDownload(url, filename, btn),
       });
     } else {
-      fallbackDownload(url, filename);
+      fallbackDownload(url, filename, btn);
     }
-    if (btn) { btn.textContent = "✓ Saved"; btn.classList.add("done"); }
   }
 
   function downloadBlobVtt(entry, btn) {
@@ -683,7 +740,7 @@
     if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); }
   }
 
-  function fallbackDownload(url, filename) {
+  function fallbackDownload(url, filename, btn) {
     const a = document.createElement("a");
     a.href = url;
     a.download = filename;
@@ -691,6 +748,7 @@
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); }
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
