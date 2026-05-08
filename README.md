@@ -2,6 +2,14 @@
 
 A browser extension for Chrome and Firefox that detects WebVTT subtitle files on any webpage and lets you download them with one click.
 
+## Download the extension
+
+1. Go to the repository on GitHub
+2. Click the green **Code** button
+3. Select **Download ZIP**
+4. Unzip the downloaded file — you should see a folder containing `manifest.json`, `background.js`, `content.js`, `popup.html`, `popup.js`, and an `icons` folder
+5. Keep the folder somewhere permanent (e.g. `Documents`) — Chrome and Firefox load the extension directly from this folder
+
 ## Install
 
 ### Chrome
