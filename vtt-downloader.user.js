@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.7.0
+// @version      1.8.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -718,12 +718,15 @@
     // 1. Try regular fetch (works if the page already has CORS access)
     try {
       const resp = await fetch(url, { credentials: "include" });
+      if (resp.status === 429) throw new Error("Rate limited (429) — wait a moment before continuing");
       if (resp.ok) {
         const text = await resp.text();
         saveTextAsVtt(text, filename, btn);
         return;
       }
-    } catch {}
+    } catch (e) {
+      if (e.message && e.message.includes("429")) throw e; // propagate to season loop
+    }
 
     // 2. Try GM_xmlhttpRequest — privileged context bypasses CORS
     if (typeof GM_xmlhttpRequest !== "undefined") {
@@ -916,18 +919,31 @@
     return false;
   }
 
+  // Wait for at least one VTT to appear (metadata is checked separately).
   async function waitForVttEntries(timeoutMs) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (seasonStop) return null;
-      if (foundVtts.size > 0 && getEpisodeMetadata()) {
-        // Give a brief grace period for additional language tracks to arrive
-        await sleep(800);
+      if (foundVtts.size > 0) {
+        await sleep(800); // grace period for additional tracks
         return [...foundVtts.values()];
       }
       await sleep(500);
     }
     return foundVtts.size > 0 ? [...foundVtts.values()] : null;
+  }
+
+  // Wait separately for page metadata (JSON-LD / title) to be ready.
+  // Crunchyroll client-side renders JSON-LD, so it can lag behind VTT detection.
+  async function waitForMetadata(timeoutMs = 12000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (seasonStop) return null;
+      const m = getEpisodeMetadata();
+      if (m) return m;
+      await sleep(400);
+    }
+    return getEpisodeMetadata(); // return whatever we have, even if incomplete
   }
 
   async function tryAutoplay() {
@@ -950,12 +966,14 @@
 
   // Wait for the current download to feasibly finish before navigating away.
   async function downloadAndWait(entry) {
+    // Ensure metadata is ready before building the filename — JSON-LD can lag.
+    await waitForMetadata(12000);
     const filename = buildFilename(entry);
     const fakeBtn = { textContent: "", classList: { add: () => {}, remove: () => {} } };
     if (entry.isHls)       await downloadHls({ ...entry, filename }, fakeBtn);
     else if (entry.isBlob) downloadBlobVtt({ ...entry, filename }, fakeBtn);
     else                   await downloadDirect(entry.url, filename, fakeBtn);
-    await sleep(1500); // let the browser finish writing
+    await sleep(1500);
   }
 
   async function toggleSeasonDownload() {
@@ -989,10 +1007,22 @@
       try {
         await downloadAndWait(next);
       } catch (e) {
-        setBanner(`⚠️ Download failed for ${epTitle}: ${e.message || e}`);
+        const msg = e.message || String(e);
+        setBanner(`⚠️ ${msg}`);
+        if (msg.includes("429") || msg.toLowerCase().includes("rate limit")) {
+          setBanner(`🚫 Rate limited by server after ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}. Try again later.`);
+          break;
+        }
         await sleep(2000);
       }
 
+      if (seasonStop) break;
+
+      setBanner(`✅ Saved ${epTitle}. Pausing before next episode…`);
+
+      // Brief jittered pause — keeps request cadence human-paced and
+      // reduces any chance of triggering Crunchyroll's rate limiter.
+      await sleep(2000 + Math.random() * 2000);
       if (seasonStop) break;
 
       setBanner(`✅ Saved ${epTitle}. Looking for next episode…`);
