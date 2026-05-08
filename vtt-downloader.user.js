@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.8.0
+// @version      1.9.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -34,7 +34,8 @@
   let panel = null;
   let fab = null;
   let uiReady = false;
-  let metaCache = null; // cached episode metadata for this page
+  let metaCache = null;     // cached episode metadata for this page
+  let metaCacheUrl = null;  // the URL the cache was extracted from (auto-invalidates on SPA nav)
   let seasonActive = false;
   let seasonStop = false;
   let seasonCount = 0;
@@ -361,10 +362,29 @@
 
   // ── Episode metadata & filename formatting ─────────────────────────────────
 
+  // Compare two URLs by pathname only (ignores query string differences).
+  function pathsMatch(a, b) {
+    try { return new URL(a, location.href).pathname === new URL(b, location.href).pathname; }
+    catch { return false; }
+  }
+
   function getEpisodeMetadata() {
+    // Auto-invalidate the cache whenever we're now on a different page than when
+    // the cache was set. This catches the small race between SPA navigation and
+    // our 1s URL-change interval — without it, stale data from the previous
+    // episode can get cached and reused even after navigation.
+    if (metaCache && metaCacheUrl !== location.href) {
+      metaCache = null;
+      metaCacheUrl = null;
+    }
     if (metaCache) return metaCache;
 
-    // 1. JSON-LD structured data — most reliable across sites
+    const here = location.href;
+    const cache = (m) => { metaCache = m; metaCacheUrl = here; return m; };
+
+    // 1. JSON-LD structured data — most reliable. We verify the ld's own `url`
+    //    field matches the current page URL so we ignore stale data left over
+    //    from a previous episode while the SPA hasn't swapped it in yet.
     for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
         const root = JSON.parse(el.textContent);
@@ -374,45 +394,40 @@
           const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
           const title  = (node.name || "").trim();
           if (!series || !title) continue;
-          metaCache = {
+
+          // Reject stale entries: if the JSON-LD has a url that doesn't match
+          // the current page, this is leftover data from a previous episode.
+          const ldUrl = (node.url || "").trim();
+          if (ldUrl && !pathsMatch(ldUrl, here)) continue;
+
+          return cache({
             series,
             season:  parseInt(node.partOfSeason?.seasonNumber, 10) || 1,
             episode: parseInt(node.episodeNumber, 10) || 1,
             title,
-          };
-          return metaCache;
+          });
         }
       } catch {}
     }
 
-    // 2. Page title / og:title — Crunchyroll formats:
-    //    "Watch Chainsaw Man Episode 1 - DOG & CHAINSAW | Crunchyroll"
-    //    "Chainsaw Man - DOG & CHAINSAW | Crunchyroll"
+    // 2. Page title / og:title fallbacks
     const candidates = [
       document.querySelector('meta[property="og:title"]')?.content || "",
       document.title,
     ];
     for (const raw of candidates) {
       const s = raw
-        .replace(/\s*\|\s*[^|]+$/, "")  // strip trailing "| Site Name"
-        .replace(/^Watch\s+/i, "")       // strip leading "Watch "
+        .replace(/\s*\|\s*[^|]+$/, "")
+        .replace(/^Watch\s+/i, "")
         .trim();
 
-      // "{Series} [Season N ]Episode N - {Title}"
       let m = s.match(/^(.+?)\s+(?:Season\s+(\d+)\s+)?Episode\s+(\d+)\s*[-–]\s*(.+)$/i);
-      if (m) {
-        metaCache = { series: m[1].trim(), season: parseInt(m[2], 10) || 1,
-                      episode: parseInt(m[3], 10), title: m[4].trim() };
-        return metaCache;
-      }
+      if (m) return cache({ series: m[1].trim(), season: parseInt(m[2], 10) || 1,
+                            episode: parseInt(m[3], 10), title: m[4].trim() });
 
-      // "{Series} - S{N}E{N} - {Title}"
       m = s.match(/^(.+?)\s*-\s*S(\d+)\s*E(\d+)\s*[-–]\s*(.+)$/i);
-      if (m) {
-        metaCache = { series: m[1].trim(), season: parseInt(m[2], 10),
-                      episode: parseInt(m[3], 10), title: m[4].trim() };
-        return metaCache;
-      }
+      if (m) return cache({ series: m[1].trim(), season: parseInt(m[2], 10),
+                            episode: parseInt(m[3], 10), title: m[4].trim() });
     }
 
     return null;
@@ -1096,6 +1111,7 @@
           blobVttStore.clear();
           hlsSegmentUrls.clear();
           metaCache = null;
+          metaCacheUrl = null;
           setTimeout(scanDOM, 600);
           updateUI();
         }
