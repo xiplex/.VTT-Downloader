@@ -1,18 +1,25 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.2.0
+// @version      1.3.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_addStyle
+// @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
 // ==/UserScript==
 
 (function () {
   "use strict";
+
+  // Use the page's real window so our patches affect the page's fetch / XHR.
+  // With @grant directives Tampermonkey runs in an isolated context where
+  // `window` is a wrapper — `unsafeWindow` is the actual page window.
+  const pageWin = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const isTopFrame = (() => { try { return window === window.top; } catch { return false; } })();
 
   // url -> { url, filename, source, isHls?, isBlob? }
   const foundVtts = new Map();
@@ -23,6 +30,28 @@
   let panel = null;
   let fab = null;
   let uiReady = false;
+
+  // Report a found VTT — bubble up from iframes to the top frame's UI
+  function reportVtt(url, source, extra) {
+    if (isTopFrame) {
+      if (addVtt(url, source, extra)) updateUI();
+    } else {
+      try {
+        window.top.postMessage({
+          __vtt_downloader: true,
+          type: "vtt_found",
+          url, source,
+          extra: extra && {
+            isHls: !!extra.isHls,
+            isBlob: !!extra.isBlob,
+            filename: extra.filename,
+            hlsLabel: extra.hlsLabel,
+            hlsSegments: extra.hlsSegments,
+          },
+        }, "*");
+      } catch {}
+    }
+  }
 
   // ── URL / content-type helpers ─────────────────────────────────────────────
 
@@ -113,7 +142,6 @@
     // Master playlist — extract subtitle track URIs
     const extMediaRe = /#EXT-X-MEDIA:([^\r\n]+)/g;
     let m;
-    let found = false;
     while ((m = extMediaRe.exec(text)) !== null) {
       const attrs = parseM3U8Attrs(m[1]);
       if (attrs.TYPE !== "SUBTITLES" && attrs.TYPE !== "CLOSED-CAPTIONS") continue;
@@ -121,14 +149,11 @@
       const trackUrl = resolveUrl(attrs.URI, fromUrl);
       const name = attrs.NAME || attrs.LANGUAGE || "Subtitles";
       const lang = attrs.LANGUAGE || "";
-      if (addVtt(trackUrl, "hls", {
+      reportVtt(trackUrl, "hls", {
         filename: `${name}${lang ? "_" + lang : ""}.vtt`,
         isHls: true,
         hlsLabel: name,
-      })) {
-        found = true;
-        updateUI();
-      }
+      });
     }
 
     // Subtitle segment playlist — lines that aren't comments are segment URLs
@@ -136,26 +161,19 @@
     const segUrls = lines
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#"))
-      .filter((l) => {
-        // Only include if looks like a URL (relative or absolute)
-        try { new URL(l, fromUrl); return true; } catch { return false; }
-      })
+      .filter((l) => { try { new URL(l, fromUrl); return true; } catch { return false; } })
       .map((l) => resolveUrl(l, fromUrl));
 
     if (segUrls.length > 0 && text.includes("EXTINF")) {
-      // This IS a subtitle segment playlist — add the playlist itself for merged download
-      if (addVtt(fromUrl, "hls", {
+      reportVtt(fromUrl, "hls", {
         isHls: true,
         hlsSegments: segUrls,
         filename: filenameFromUrl(fromUrl, "subtitles.vtt"),
         hlsLabel: "HLS Subtitles",
-      })) {
-        found = true;
-        updateUI();
-      }
+      });
     }
 
-    return found;
+    return true;
   }
 
   // ── Response body inspection ───────────────────────────────────────────────
@@ -163,21 +181,20 @@
   function inspectBody(text, finalUrl) {
     const trimmed = text.trimStart();
     if (trimmed.startsWith("WEBVTT")) {
-      if (addVtt(finalUrl, "network")) updateUI();
+      reportVtt(finalUrl, "network");
       return;
     }
     if (trimmed.startsWith("#EXTM3U")) {
       processM3U8Body(text, finalUrl);
       return;
     }
-    // JSON API responses — scan for VTT URLs in string values
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try {
         const scanObj = (obj, depth) => {
           if (depth > 6 || !obj || typeof obj !== "object") return;
           for (const val of Object.values(obj)) {
             if (typeof val === "string" && isVttUrl(val)) {
-              if (addVtt(val, "api")) updateUI();
+              reportVtt(val, "api");
             } else if (val && typeof val === "object") {
               scanObj(val, depth + 1);
             }
@@ -190,13 +207,14 @@
 
   // ── Network interception ───────────────────────────────────────────────────
 
-  // Patch fetch
-  const origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    const url = typeof input === "string" ? input : input?.url;
-    if (url && isVttUrl(url) && addVtt(url, "network")) updateUI();
+  // Patch the PAGE'S fetch via unsafeWindow so we actually catch real requests.
+  const origFetch = pageWin.fetch.bind(pageWin);
+  pageWin.fetch = function (input, init) {
+    let url = "";
+    try { url = typeof input === "string" ? input : (input && input.url) || ""; } catch {}
+    if (url && isVttUrl(url)) reportVtt(url, "network");
 
-    const promise = origFetch.apply(this, arguments);
+    const promise = origFetch(input, init);
 
     if (url) {
       promise.then((response) => {
@@ -205,10 +223,7 @@
           const cl = response.headers.get("content-length") || "";
           const finalUrl = response.url || url;
 
-          if (isVttContentType(ct)) {
-            if (addVtt(finalUrl, "network")) updateUI();
-            return;
-          }
+          if (isVttContentType(ct)) { reportVtt(finalUrl, "network"); return; }
           if (isHlsContentType(ct)) {
             response.clone().text().then((t) => processM3U8Body(t, finalUrl)).catch(() => {});
             return;
@@ -223,36 +238,33 @@
     return promise;
   };
 
-  // Patch XMLHttpRequest
-  const OrigXHR = window.XMLHttpRequest;
+  // Patch the PAGE's XMLHttpRequest
+  const OrigXHR = pageWin.XMLHttpRequest;
   function PatchedXHR() {
     const xhr = new OrigXHR();
     let pendingUrl = null;
 
-    const origOpen = xhr.open.bind(xhr);
+    const origOpen = xhr.open;
     xhr.open = function (method, url, ...rest) {
       pendingUrl = url;
-      if (isVttUrl(url) && addVtt(url, "network")) updateUI();
-      return origOpen(method, url, ...rest);
+      if (isVttUrl(url)) reportVtt(url, "network");
+      return origOpen.call(xhr, method, url, ...rest);
     };
 
     xhr.addEventListener("load", function () {
       if (!pendingUrl) return;
-      const ct = xhr.getResponseHeader("content-type") || "";
-      const cl = xhr.getResponseHeader("content-length") || "";
+      const ct = xhr.getResponseHeader && xhr.getResponseHeader("content-type") || "";
+      const cl = xhr.getResponseHeader && xhr.getResponseHeader("content-length") || "";
       const finalUrl = xhr.responseURL || pendingUrl;
 
-      if (isVttContentType(ct)) {
-        if (addVtt(finalUrl, "network")) updateUI();
-        return;
-      }
+      if (isVttContentType(ct)) { reportVtt(finalUrl, "network"); return; }
       if (isHlsContentType(ct)) {
         const t = xhr.responseText;
         if (t) processM3U8Body(t, finalUrl);
         return;
       }
       if (shouldInspectBody(ct, cl)) {
-        const t = xhr.responseType === "" || xhr.responseType === "text"
+        const t = (xhr.responseType === "" || xhr.responseType === "text")
           ? xhr.responseText
           : null;
         if (t) inspectBody(t, finalUrl);
@@ -262,57 +274,52 @@
     return xhr;
   }
   PatchedXHR.prototype = OrigXHR.prototype;
-  window.XMLHttpRequest = PatchedXHR;
+  try { pageWin.XMLHttpRequest = PatchedXHR; } catch {}
 
-  // Intercept blob: URLs created from VTT content (e.g. ASS→VTT conversion)
-  const origCreateObjectURL = URL.createObjectURL;
-  URL.createObjectURL = function (obj) {
-    const blobUrl = origCreateObjectURL.call(URL, obj);
-    if (obj instanceof Blob && obj.size < 524288) {
-      obj.text().then((text) => {
-        if (text.trimStart().startsWith("WEBVTT")) {
-          blobVttStore.set(blobUrl, text);
-          if (addVtt(blobUrl, "blob", { isBlob: true, blobText: text })) updateUI();
-        }
-      }).catch(() => {});
-    }
+  // Intercept blob: URLs created from VTT content (e.g. ASS→VTT conversion).
+  // Patch the page's URL constructor methods.
+  const origCreateObjectURL = pageWin.URL.createObjectURL.bind(pageWin.URL);
+  pageWin.URL.createObjectURL = function (obj) {
+    const blobUrl = origCreateObjectURL(obj);
+    try {
+      if (obj && obj.size != null && obj.size < 524288 && typeof obj.text === "function") {
+        obj.text().then((text) => {
+          if (text && text.trimStart().startsWith("WEBVTT")) {
+            blobVttStore.set(blobUrl, text);
+            reportVtt(blobUrl, "blob", { isBlob: true, blobText: text });
+          }
+        }).catch(() => {});
+      }
+    } catch {}
     return blobUrl;
   };
 
-  const origRevokeObjectURL = URL.revokeObjectURL;
-  URL.revokeObjectURL = function (url) {
-    // Keep blobVttStore entry — user may still want to download it
-    return origRevokeObjectURL.call(URL, url);
-  };
+  const origRevokeObjectURL = pageWin.URL.revokeObjectURL.bind(pageWin.URL);
+  // Don't actually overwrite — let the page revoke normally; we keep the text
+  // in blobVttStore independent of the URL's lifecycle.
+  void origRevokeObjectURL;
 
   // ── DOM scanning ───────────────────────────────────────────────────────────
 
   function scanDOM() {
-    let changed = false;
-
     document.querySelectorAll("track[src]").forEach((el) => {
       const url = el.src || el.getAttribute("src");
-      if (url && isVttUrl(url) && addVtt(url, "track")) changed = true;
+      if (url && isVttUrl(url)) reportVtt(url, "track");
     });
-
     document.querySelectorAll("source[src]").forEach((el) => {
       const url = el.src || el.getAttribute("src");
-      if (url && isVttUrl(url) && addVtt(url, "track")) changed = true;
+      if (url && isVttUrl(url)) reportVtt(url, "track");
     });
-
     document.querySelectorAll("a[href]").forEach((el) => {
       const url = el.getAttribute("href");
-      if (url && isVttUrl(url) && addVtt(url, "link")) changed = true;
+      if (url && isVttUrl(url)) reportVtt(url, "link");
     });
-
     document.querySelectorAll("script:not([src])").forEach((el) => {
       const matches = (el.textContent || "").match(/https?:\/\/[^\s"'<>]+\.vtt[^\s"'<>]*/gi) || [];
       for (const raw of matches) {
-        if (addVtt(raw.replace(/[,;)\]}>]+$/, ""), "script")) changed = true;
+        reportVtt(raw.replace(/[,;)\]}>]+$/, ""), "script");
       }
     });
-
-    if (changed) updateUI();
   }
 
   // ── Styles ─────────────────────────────────────────────────────────────────
@@ -533,7 +540,7 @@
 
       // If we only have the playlist URL, fetch it first
       if (!segments) {
-        const resp = await origFetch(entry.url);
+        const resp = await fetch(entry.url);
         const text = await resp.text();
         const lines = text.split(/\r?\n/);
         segments = lines
@@ -544,7 +551,7 @@
 
       if (segments.length === 0) {
         // Maybe the URL itself is a plain VTT file
-        const resp = await origFetch(entry.url);
+        const resp = await fetch(entry.url);
         const text = await resp.text();
         if (text.trimStart().startsWith("WEBVTT")) {
           saveTextAsVtt(text, entry.filename, btn);
@@ -557,7 +564,7 @@
       const parts = [];
       for (let i = 0; i < segments.length; i++) {
         if (btn) btn.textContent = `⏳ ${i + 1}/${segments.length}`;
-        const r = await origFetch(segments[i]);
+        const r = await fetch(segments[i]);
         parts.push(await r.text());
       }
 
@@ -597,21 +604,34 @@
   // ── Bootstrap ──────────────────────────────────────────────────────────────
 
   function init() {
-    buildUI();
+    if (isTopFrame) {
+      buildUI();
+
+      // Listen for VTT detections from iframed players (Crunchyroll's vilos, etc.)
+      window.addEventListener("message", (e) => {
+        const d = e.data;
+        if (!d || !d.__vtt_downloader || d.type !== "vtt_found") return;
+        if (addVtt(d.url, d.source, d.extra || {})) updateUI();
+      });
+    }
+
     scanDOM();
 
     const observer = new MutationObserver(() => scanDOM());
     observer.observe(document.documentElement, { childList: true, subtree: true });
 
-    let lastUrl = location.href;
-    setInterval(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        foundVtts.clear();
-        blobVttStore.clear();
-        setTimeout(scanDOM, 600);
-      }
-    }, 1000);
+    if (isTopFrame) {
+      let lastUrl = location.href;
+      setInterval(() => {
+        if (location.href !== lastUrl) {
+          lastUrl = location.href;
+          foundVtts.clear();
+          blobVttStore.clear();
+          setTimeout(scanDOM, 600);
+          updateUI();
+        }
+      }, 1000);
+    }
   }
 
   if (document.readyState === "loading") {
