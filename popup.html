@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VTT Downloader</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --border: #334155;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --success: #22c55e;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      width: 360px;
+      min-height: 120px;
+      max-height: 520px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    header .logo {
+      width: 28px;
+      height: 28px;
+      background: var(--accent);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      flex: 1;
+    }
+
+    header .badge {
+      background: var(--accent);
+      color: #fff;
+      border-radius: 12px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      display: none;
+    }
+
+    header .badge.visible { display: inline-block; }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .toolbar-left {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .btn-download-all {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      padding: 5px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-download-all:hover { background: var(--accent-hover); }
+    .btn-download-all:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    #vtt-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 16px;
+      gap: 10px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .empty-state .icon {
+      font-size: 36px;
+      opacity: 0.5;
+    }
+
+    .empty-state p {
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .vtt-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .vtt-item:last-child { margin-bottom: 0; }
+
+    .vtt-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .vtt-name {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .vtt-source {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .vtt-source .tag {
+      display: inline-block;
+      background: #1e3a5f;
+      color: #60a5fa;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 9px;
+      font-weight: 600;
+      margin-right: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .btn-download {
+      background: transparent;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s, color 0.15s;
+      flex-shrink: 0;
+    }
+
+    .btn-download:hover {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-download.downloaded {
+      border-color: var(--success);
+      color: var(--success);
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .btn-rescan {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: 11px;
+      cursor: pointer;
+      padding: 2px 0;
+      transition: color 0.15s;
+    }
+    .btn-rescan:hover { color: var(--text); }
+
+    .status-text {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">VTT</div>
+    <h1>VTT Downloader</h1>
+    <span class="badge" id="count-badge">0</span>
+  </header>
+
+  <div class="toolbar">
+    <span class="toolbar-left" id="scan-status">Scanning page...</span>
+    <button class="btn-download-all" id="btn-download-all" disabled>Download All</button>
+  </div>
+
+  <div id="vtt-list">
+    <div class="empty-state" id="empty-state">
+      <div class="icon">🔍</div>
+      <p>Scanning for VTT subtitle files…</p>
+    </div>
+  </div>
+
+  <footer>
+    <button class="btn-rescan" id="btn-rescan">↺ Rescan page</button>
+    <span class="status-text" id="footer-status"></span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
