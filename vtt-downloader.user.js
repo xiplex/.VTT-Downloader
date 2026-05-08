@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.6.0
+// @version      1.7.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -26,6 +26,9 @@
   const foundVtts = new Map();
   // blob: url -> vtt text content (so we can re-download after page revokes it)
   const blobVttStore = new Map();
+  // VTT segment URLs that belong to a known HLS subtitle playlist — these
+  // shouldn't appear as separate entries since the playlist entry merges them all.
+  const hlsSegmentUrls = new Set();
 
   let panelVisible = false;
   let panel = null;
@@ -111,6 +114,31 @@
     try { return new URL(url).hostname; } catch { return url.slice(0, 30); }
   }
 
+  // Strict filter — only accept tracks labeled as English [CC] (closed captions).
+  // Matches: "English [CC]", "English (CC)", "English CC", "English Closed Captions",
+  // "EN [CC]", etc. Rejects plain "English", "English (Dubs)", "Spanish", and so on.
+  function isEnglishCC(label) {
+    if (!label) return false;
+    const l = String(label).toLowerCase();
+    const isEnglish = /\benglish\b|\beng\b|\b(?:en|en-us|en-gb)\b/.test(l);
+    const hasCC = /\[\s*cc\s*\]|\(\s*cc\s*\)|\bcc\b|closed[\s-]*caption|\bsdh\b/.test(l);
+    return isEnglish && hasCC;
+  }
+
+  // URL-only hint check for cases where no label is available.
+  function urlSuggestsEnglishCC(url) {
+    if (!url) return false;
+    try {
+      const u = new URL(url, location.href);
+      const path = (u.pathname + " " + u.search).toLowerCase();
+      const isEnglish = /(^|[^a-z])(en|eng|english|en[-_]us|en[-_]gb)([^a-z]|$)/.test(path);
+      const hasCC = /(^|[^a-z])(cc|caption|captions|sdh)([^a-z]|$)/.test(path);
+      return isEnglish && hasCC;
+    } catch {
+      return false;
+    }
+  }
+
   function sourceLabel(src) {
     return { network: "Network", track: "<track>", link: "<a>",
              script: "<script>", blob: "Blob", hls: "HLS", api: "API" }[src] || src;
@@ -121,6 +149,16 @@
   function addVtt(url, source, extra) {
     const resolved = resolveUrl(url);
     if (!resolved || foundVtts.has(resolved)) return false;
+
+    // Strict filter: only English [CC] tracks ever enter the panel.
+    if (hlsSegmentUrls.has(resolved)) return false; // belongs to an HLS playlist entry
+    const label = (extra && (extra.hlsLabel || extra.trackLabel)) || "";
+    if (label) {
+      if (!isEnglishCC(label)) return false;
+    } else if (!urlSuggestsEnglishCC(resolved)) {
+      return false;
+    }
+
     foundVtts.set(resolved, {
       url: resolved,
       filename: filenameFromUrl(resolved),
@@ -154,6 +192,8 @@
       const trackUrl = resolveUrl(attrs.URI, fromUrl);
       const name = attrs.NAME || attrs.LANGUAGE || "Subtitles";
       const lang = attrs.LANGUAGE || "";
+      // Only allow English [CC] tracks
+      if (!isEnglishCC(`${name} ${lang}`)) continue;
       reportVtt(trackUrl, "hls", {
         filename: `${name}${lang ? "_" + lang : ""}.vtt`,
         isHls: true,
@@ -170,12 +210,25 @@
       .map((l) => resolveUrl(l, fromUrl));
 
     if (segUrls.length > 0 && text.includes("EXTINF")) {
-      reportVtt(fromUrl, "hls", {
-        isHls: true,
-        hlsSegments: segUrls,
-        filename: filenameFromUrl(fromUrl, "subtitles.vtt"),
-        hlsLabel: "HLS Subtitles",
-      });
+      // Remember segment URLs so they don't appear as separate entries, and
+      // remove any that may have already slipped in via earlier network detection.
+      let removedAny = false;
+      for (const seg of segUrls) {
+        hlsSegmentUrls.add(seg);
+        if (foundVtts.delete(seg)) removedAny = true;
+      }
+      if (removedAny && isTopFrame) updateUI();
+
+      // Only register the playlist itself when its URL hints that it's English [CC]
+      // (so non-English subtitle playlists don't sneak in via this path).
+      if (urlSuggestsEnglishCC(fromUrl)) {
+        reportVtt(fromUrl, "hls", {
+          isHls: true,
+          hlsSegments: segUrls,
+          filename: filenameFromUrl(fromUrl, "subtitles.vtt"),
+          hlsLabel: "English [CC]",
+        });
+      }
     }
 
     return true;
@@ -416,7 +469,13 @@
     document.querySelectorAll("track[src]").forEach((el) => {
       const url = el.src || el.getAttribute("src");
       const trackLabel = el.label || el.getAttribute("label") || "";
-      if (url && isVttUrl(url)) reportVtt(url, "track", { trackLabel });
+      const trackLang  = el.srclang || el.getAttribute("srclang") || "";
+      const trackKind  = el.kind || el.getAttribute("kind") || "";
+      // Only allow English [CC] — match label, or "captions" kind + English srclang
+      const labelMatch = isEnglishCC(`${trackLabel} ${trackLang}`);
+      const kindMatch  = trackKind === "captions" && /^en\b/i.test(trackLang);
+      if (!labelMatch && !kindMatch) return;
+      if (url && isVttUrl(url)) reportVtt(url, "track", { trackLabel: trackLabel || "English [CC]" });
     });
     document.querySelectorAll("source[src]").forEach((el) => {
       const url = el.src || el.getAttribute("src");
@@ -1005,6 +1064,7 @@
           lastUrl = location.href;
           foundVtts.clear();
           blobVttStore.clear();
+          hlsSegmentUrls.clear();
           metaCache = null;
           setTimeout(scanDOM, 600);
           updateUI();
