@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.16.0
+// @version      1.17.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -433,10 +433,11 @@
 
     const here = location.href;
 
-    // ── Source 1: og:title / document.title ───────────────────────────────────
+    // ── Source 1: og:title / document.title / twitter:title ───────────────────
     // Always reflects the current SPA route — never stale.
     for (const raw of [
       document.querySelector('meta[property="og:title"]')?.content || "",
+      document.querySelector('meta[name="twitter:title"]')?.content || "",
       document.title,
     ]) {
       const m = parseTitleString(raw);
@@ -445,7 +446,25 @@
       }
     }
 
-    // ── Source 2: JSON-LD TVEpisode ────────────────────────────────────────────
+    // ── Source 2: meta[name="description"] ────────────────────────────────────
+    // Crunchyroll descriptions often read:
+    //   "Watch Series Episode N, Episode Title on Crunchyroll. Plot text…"
+    //   "Watch Series – E1 – Episode Title on Crunchyroll."
+    const desc = (document.querySelector('meta[name="description"]')?.content || "").trim();
+    if (desc) {
+      let m = desc.match(/Watch\s+(.+?)\s+Episode\s+(\d+)[,\s–-]+(.+?)\s+on\s+Crunchyroll/i);
+      if (m && m[3].trim().toLowerCase() !== m[1].trim().toLowerCase()) {
+        const meta = { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
+        metaCache = meta; metaCacheUrl = here; return meta;
+      }
+      m = desc.match(/Watch\s+(.+?)\s*[-–]\s*Ep?\.?\s*(\d+)\s*[-–:]\s*(.+?)\s+on\s+Crunchyroll/i);
+      if (m && m[3].trim().toLowerCase() !== m[1].trim().toLowerCase()) {
+        const meta = { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
+        metaCache = meta; metaCacheUrl = here; return meta;
+      }
+    }
+
+    // ── Source 3: JSON-LD TVEpisode ────────────────────────────────────────────
     // Has structured season/episode numbers; episode title needs cleaning.
     for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
@@ -470,6 +489,31 @@
       } catch {}
     }
 
+    // ── Source 4: DOM heading scan ─────────────────────────────────────────────
+    // The episode title is displayed on screen as "E1 – That's How Love Starts…"
+    // Scan heading-level elements for this pattern as a last resort.
+    const seriesFromOg = (
+      document.querySelector('meta[property="og:title"]')?.content || document.title || ""
+    ).replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").replace(/\s*[-–].*$/, "").trim();
+
+    for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,p,[class*="title"],[class*="episode"]')) {
+      const text = (el.textContent || "").trim();
+      if (text.length < 4 || text.length > 120) continue;
+      const m = text.match(/^Ep?(?:isode)?\s*\.?\s*(\d+)\s*[-–:]\s*(.{3,})$/i);
+      if (!m) continue;
+      const title = m[2].trim();
+      if (!seriesFromOg || title.toLowerCase() === seriesFromOg.toLowerCase()) continue;
+      const meta = { series: seriesFromOg, season: 1, episode: +m[1], title };
+      metaCache = meta; metaCacheUrl = here; return meta;
+    }
+
+    // Log what we found so the issue can be diagnosed from the DevTools console.
+    console.debug(
+      "[VTT Downloader] metadata extraction failed\n",
+      " og:title:", document.querySelector('meta[property="og:title"]')?.content, "\n",
+      " doc title:", document.title, "\n",
+      " description:", (document.querySelector('meta[name="description"]')?.content || "").slice(0, 200),
+    );
     return null;
   }
 
