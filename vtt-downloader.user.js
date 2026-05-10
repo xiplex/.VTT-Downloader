@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.15.0
+// @version      1.16.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -362,123 +362,112 @@
 
   // ── Episode metadata & filename formatting ─────────────────────────────────
 
-  // Compare two URLs by pathname only (ignores query string differences).
   function pathsMatch(a, b) {
     try { return new URL(a, location.href).pathname === new URL(b, location.href).pathname; }
     catch { return false; }
   }
 
-  // Derive basic metadata from the current URL slug + head tags.
-  // Crunchyroll URLs: /watch/<mediaId>/<episode-title-slug>
-  // This source reads the live URL so it can never be stale — used as the
-  // final fallback when JSON-LD and page-title parsing both come up empty.
-  function parseUrlSlugMeta() {
-    const m = location.pathname.match(/\/watch\/[^/]+\/([^/?#]+)/i);
-    if (!m) return null;
-    const title = m[1]
-      .replace(/-/g, " ")
-      .replace(/\b\w/g, (c) => c.toUpperCase());
-    const ogRaw = (
-      document.querySelector('meta[property="og:title"]')?.content ||
-      document.title || ""
-    ).trim();
-    // Strip trailing " | Crunchyroll" and episode subtitle to isolate the series
-    const series = ogRaw
-      .replace(/\s*\|\s*[^|]+$/, "")
-      .replace(/^Watch\s+/i, "")
-      .replace(/\s*[-–].*$/, "")
+  // Strip any leading noise from a raw episode title string so only the actual
+  // episode name remains.  Handles two kinds of prefix:
+  //   • Series name prefix  → "Chainsaw Man – Dog & Chainsaw" → "Dog & Chainsaw"
+  //   • Episode number prefix → "E1 – Title", "Season 1 E1 – Title" → "Title"
+  function cleanEpisodeTitle(raw, series) {
+    if (!raw) return "";
+    let t = raw.trim();
+    // Strip series-name prefix first (e.g. "DAN DA DAN – That's How...")
+    if (series) {
+      const esc = series.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      t = t.replace(new RegExp(`^${esc}\\s*[-–:,]\\s*`, "i"), "").trim();
+    }
+    // Iteratively strip season/episode number prefixes
+    let prev;
+    do {
+      prev = t;
+      t = t
+        .replace(/^Season\s+\d+(?:\s+Part\s+\d+)?\s*[-–:|]?\s*/i, "")
+        .replace(/^Part\s+\d+\s*[-–:|]?\s*/i, "")
+        .replace(/^S\d+\s*E\d+\s*[-–:|]\s*/i, "")
+        .replace(/^Ep?\.?\s*\d+\s*[-–:|]\s*/i, "")
+        .trim();
+    } while (t !== prev && t.length > 0);
+    return t || raw.trim();
+  }
+
+  // Parse an og:title or document.title string into episode metadata.
+  // Covers the main formats Crunchyroll uses:
+  //   "Watch Series Season 2 Episode 5 – Title | Crunchyroll"
+  //   "Watch Series Episode 5 – Title | Crunchyroll"
+  //   "Watch Series – E5 – Title | Crunchyroll"   (short format)
+  //   "Watch Series - S1E5 – Title | Crunchyroll"
+  function parseTitleString(raw) {
+    const s = raw
+      .replace(/\s*\|\s*[^|]+$/, "")   // drop "| Crunchyroll" suffix
+      .replace(/^Watch\s+/i, "")        // drop "Watch " prefix
+      .replace(/\s+Online\s*$/i, "")    // drop trailing "Online"
       .trim();
-    // Pull episode number if visible in the title: "Episode 5" / "Ep.5"
-    const epM = (ogRaw + " " + document.title).match(/\bEp(?:isode)?\s*\.?\s*(\d+)\b/i);
-    return {
-      series: series || "Unknown",
-      season: 1,
-      episode: epM ? parseInt(epM[1], 10) : 1,
-      title,
-    };
+    if (!s) return null;
+
+    let m;
+    // "Series Season 2 Episode 5 – Title"
+    m = s.match(/^(.+?)\s+Season\s+(\d+)\s+Episode\s+(\d+)\s*[-–:]\s*(.+)$/i);
+    if (m) return { series: m[1].trim(), season: +m[2], episode: +m[3], title: m[4].trim() };
+
+    // "Series Episode 5 – Title"
+    m = s.match(/^(.+?)\s+Episode\s+(\d+)\s*[-–:]\s*(.+)$/i);
+    if (m) return { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
+
+    // "Series – E5 – Title"  or  "Series - Ep5 - Title"
+    m = s.match(/^(.+?)\s*[-–]\s*Ep?\.?\s*(\d+)\s*[-–:]\s*(.+)$/i);
+    if (m) return { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
+
+    // "Series - S1E5 – Title"
+    m = s.match(/^(.+?)\s*[-–]\s*S(\d+)E(\d+)\s*[-–:]\s*(.+)$/i);
+    if (m) return { series: m[1].trim(), season: +m[2], episode: +m[3], title: m[4].trim() };
+
+    return null;
   }
 
   function getEpisodeMetadata() {
-    // Invalidate cache on SPA navigation.
-    if (metaCache && metaCacheUrl !== location.href) {
-      metaCache = null;
-      metaCacheUrl = null;
-    }
+    if (metaCache && metaCacheUrl !== location.href) { metaCache = null; metaCacheUrl = null; }
     if (metaCache) return metaCache;
 
     const here = location.href;
 
-    // ── Source 1: JSON-LD structured data ─────────────────────────────────────
-    // If the node carries a `url` field that doesn't match the current page,
-    // skip it — that's the primary guard against stale SPA data.
-    // Also skip nodes where the episode title equals the series name — some shows
-    // (e.g. Dan Da Dan) have Crunchyroll JSON-LD that reuses the series name as
-    // the episode name, which produces a duplicate in the filename.
+    // ── Source 1: og:title / document.title ───────────────────────────────────
+    // Always reflects the current SPA route — never stale.
+    for (const raw of [
+      document.querySelector('meta[property="og:title"]')?.content || "",
+      document.title,
+    ]) {
+      const m = parseTitleString(raw);
+      if (m && m.title && m.title.toLowerCase() !== m.series.toLowerCase()) {
+        metaCache = m; metaCacheUrl = here; return m;
+      }
+    }
+
+    // ── Source 2: JSON-LD TVEpisode ────────────────────────────────────────────
+    // Has structured season/episode numbers; episode title needs cleaning.
     for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
         const root = JSON.parse(el.textContent);
-        for (const node of [].concat(root["@graph"] || root)) {
+        for (const node of [].concat(root?.["@graph"] || root)) {
           if (!/TVEpisode|Episode/i.test(node["@type"] || "")) continue;
           const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
-          const title  = (node.name || "").trim();
-          if (!series || !title) continue;
-          if (title.toLowerCase() === series.toLowerCase()) continue; // bad data
+          const rawTitle = (node.name || "").trim();
+          if (!series || !rawTitle) continue;
           const ldUrl = (node.url || "").trim();
           if (ldUrl && !pathsMatch(ldUrl, here)) continue;
+          const title = cleanEpisodeTitle(rawTitle, series);
+          if (!title || title.toLowerCase() === series.toLowerCase()) continue;
           const meta = {
             series,
             season:  parseInt(node.partOfSeason?.seasonNumber, 10) || 1,
             episode: parseInt(node.episodeNumber, 10) || 1,
             title,
           };
-          metaCache = meta; metaCacheUrl = here;
-          return meta;
+          metaCache = meta; metaCacheUrl = here; return meta;
         }
       } catch {}
-    }
-
-    // ── Source 2: og:title / document.title ───────────────────────────────────
-    // These tags update immediately on SPA navigation so they're always fresh.
-    for (const raw of [
-      document.querySelector('meta[property="og:title"]')?.content || "",
-      document.title,
-    ]) {
-      // Strip site suffix, "Watch" prefix, and trailing "Online" noise
-      const s = raw
-        .replace(/\s*\|\s*[^|]+$/, "")
-        .replace(/^Watch\s+/i, "")
-        .replace(/\s+Online\s*$/i, "")
-        .trim();
-
-      // "Series Episode 1 – Title" or "Series Season 2 Episode 3 – Title"
-      let m = s.match(/^(.+?)\s+(?:Season\s+(\d+)\s+)?Episode\s+(\d+)\s*[-–:]\s*(.+)$/i);
-      if (m) {
-        const meta = { series: m[1].trim(), season: parseInt(m[2], 10) || 1,
-                       episode: parseInt(m[3], 10), title: m[4].trim() };
-        metaCache = meta; metaCacheUrl = here; return meta;
-      }
-      // "Series – E1 – Title" (Crunchyroll's short episode format)
-      m = s.match(/^(.+?)\s*[-–]\s*Ep?\.?\s*(\d+)\s*[-–:]\s*(.+)$/i);
-      if (m) {
-        const meta = { series: m[1].trim(), season: 1,
-                       episode: parseInt(m[2], 10), title: m[3].trim() };
-        metaCache = meta; metaCacheUrl = here; return meta;
-      }
-      // "Series - S1E1 – Title"
-      m = s.match(/^(.+?)\s*-\s*S(\d+)\s*E(\d+)\s*[-–]\s*(.+)$/i);
-      if (m) {
-        const meta = { series: m[1].trim(), season: parseInt(m[2], 10),
-                       episode: parseInt(m[3], 10), title: m[4].trim() };
-        metaCache = meta; metaCacheUrl = here; return meta;
-      }
-    }
-
-    // ── Source 3: URL slug — always reflects the current page ─────────────────
-    // Only use when the slug-derived title differs from the series name;
-    // episode 1 slugs are often just the series name (e.g. /watch/.../dan-da-dan).
-    const slugMeta = parseUrlSlugMeta();
-    if (slugMeta && slugMeta.title.toLowerCase() !== slugMeta.series.toLowerCase()) {
-      metaCache = slugMeta; metaCacheUrl = here; return slugMeta;
     }
 
     return null;
@@ -488,29 +477,8 @@
     return (str || "").replace(/[/\\:*?"<>|]/g, "").replace(/\s+/g, " ").trim();
   }
 
-  // Strip leading season/episode prefixes Crunchyroll bakes into episode names.
-  // e.g. "Season 1 Part 1 E1 - Asta and Yuno" -> "Asta and Yuno"
-  //      "S1E1 - Title" -> "Title", "Episode 1: Title" -> "Title"
-  function cleanTitle(title) {
-    if (!title) return title;
-    let prev;
-    let cur = title.trim();
-    do {
-      prev = cur;
-      cur = cur
-        .replace(/^Season\s+\d+(?:\s+Part\s+\d+)?\s*[-–:|]?\s*/i, "")
-        .replace(/^Part\s+\d+\s*[-–:|]?\s*/i, "")
-        .replace(/^S\d+\s*E\d+\s*[-–:|]\s*/i, "")
-        .replace(/^E(?:pisode)?\s*\d+\s*[-–:|]\s*/i, "")
-        .trim();
-    } while (cur !== prev && cur.length > 0);
-    return cur || title.trim();
-  }
-
-  // Build the human-readable download filename.
-  // Target format: Chainsaw Man_S01E01_DOG & CHAINSAW - English [CC].vtt
-  // Always produces the formatted name — getEpisodeMetadata() guarantees a
-  // result via the URL-slug fallback, so the raw server filename is never used.
+  // Build the download filename strictly following the target format:
+  //   Chainsaw Man_S01E01_DOG & CHAINSAW - English [CC].vtt
   function buildFilename(entry) {
     const meta = getEpisodeMetadata();
     const lang = sanitizeName(entry.hlsLabel || entry.trackLabel || "English [CC]");
@@ -519,15 +487,11 @@
       const series  = sanitizeName(meta.series);
       const season  = String(meta.season  || 1).padStart(2, "0");
       const episode = String(meta.episode || 1).padStart(2, "0");
-      // Strip series name prefix if Crunchyroll baked it into the episode title
-      // e.g. "Chainsaw Man - Dog & Chainsaw" → "Dog & Chainsaw"
-      let title = sanitizeName(cleanTitle(meta.title));
-      const seriesEsc = series.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      title = title.replace(new RegExp(`^${seriesEsc}\\s*[-–:]\\s*`, "i"), "").trim() || title;
+      const title   = sanitizeName(meta.title);
       return `${series}_S${season}E${episode}_${title} - ${lang}.vtt`;
     }
 
-    // Genuine last resort (no URL slug match either): raw filename + language.
+    // Last resort: raw server filename + language label
     const base = (entry.filename || "subtitles").replace(/\.vtt$/i, "");
     return `${sanitizeName(base)} - ${lang}.vtt`;
   }
