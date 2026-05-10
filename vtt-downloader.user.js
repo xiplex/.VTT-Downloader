@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.11.0
+// @version      1.12.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -368,57 +368,38 @@
     catch { return false; }
   }
 
-  // Reject common English stop words so we don't match "the", "and", etc.
-  const STOP_WORDS = new Set([
-    "the","and","a","an","of","to","in","on","for","with","at","by","from",
-    "is","are","was","were","be","been","or","but","if","as","it","its","this",
-    "that","these","those","i","you","he","she","we","they","them","my","your",
-  ]);
-
-  function significantWords(text) {
-    return (text || "")
-      .toLowerCase()
-      .replace(/[^\w\s]/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length >= 3 && !STOP_WORDS.has(w));
-  }
-
-  // Cross-check that extracted metadata actually belongs to the page we're on.
-  // Crunchyroll URLs include a slug derived from the episode title — so if the
-  // title shares no significant words with the URL path, we likely have stale
-  // data left over from a previous episode while the SPA was still updating.
-  function verifyMetadataMatches(meta) {
-    if (!meta || !meta.series || !meta.title) return false;
-
-    const path = location.pathname.toLowerCase();
-    // cleanTitle strips "Season X Part X E# -" prefixes before word-matching so
-    // those prefix words don't appear as candidates against the URL slug.
-    const titleWords  = significantWords(cleanTitle(meta.title));
-    const seriesWords = significantWords(meta.series);
-
-    // Require at least one significant title word to appear in the URL path.
-    // Skip the check if the title has no significant words (very short titles).
-    if (titleWords.length > 0) {
-      const hit = titleWords.some((w) => path.includes(w));
-      if (!hit) return false;
-    }
-
-    // Document title should mention the series — a quick sanity check that the
-    // page chrome has updated to match the new episode.
-    const docTitle = (document.title || "").toLowerCase();
-    if (seriesWords.length > 0 && docTitle) {
-      const hit = seriesWords.some((w) => docTitle.includes(w));
-      if (!hit) return false;
-    }
-
-    return true;
+  // Derive basic metadata from the current URL slug + head tags.
+  // Crunchyroll URLs: /watch/<mediaId>/<episode-title-slug>
+  // This source reads the live URL so it can never be stale — used as the
+  // final fallback when JSON-LD and page-title parsing both come up empty.
+  function parseUrlSlugMeta() {
+    const m = location.pathname.match(/\/watch\/[^/]+\/([^/?#]+)/i);
+    if (!m) return null;
+    const title = m[1]
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+    const ogRaw = (
+      document.querySelector('meta[property="og:title"]')?.content ||
+      document.title || ""
+    ).trim();
+    // Strip trailing " | Crunchyroll" and episode subtitle to isolate the series
+    const series = ogRaw
+      .replace(/\s*\|\s*[^|]+$/, "")
+      .replace(/^Watch\s+/i, "")
+      .replace(/\s*[-–].*$/, "")
+      .trim();
+    // Pull episode number if visible in the title: "Episode 5" / "Ep.5"
+    const epM = (ogRaw + " " + document.title).match(/\bEp(?:isode)?\s*\.?\s*(\d+)\b/i);
+    return {
+      series: series || "Unknown",
+      season: 1,
+      episode: epM ? parseInt(epM[1], 10) : 1,
+      title,
+    };
   }
 
   function getEpisodeMetadata() {
-    // Auto-invalidate the cache whenever we're now on a different page than when
-    // the cache was set. This catches the small race between SPA navigation and
-    // our 1s URL-change interval — without it, stale data from the previous
-    // episode can get cached and reused even after navigation.
+    // Invalidate cache on SPA navigation.
     if (metaCache && metaCacheUrl !== location.href) {
       metaCache = null;
       metaCacheUrl = null;
@@ -426,65 +407,58 @@
     if (metaCache) return metaCache;
 
     const here = location.href;
-    // Collect every candidate from every source, then accept the first one
-    // that passes verification. This way a stale JSON-LD entry doesn't block
-    // the page-title fallback from being checked.
-    const candidates = [];
 
-    // 1. JSON-LD structured data — most reliable when fresh
+    // ── Source 1: JSON-LD structured data ─────────────────────────────────────
+    // If the node carries a `url` field that doesn't match the current page,
+    // skip it — that's the primary guard against stale SPA data.
+    // Nodes with no `url` field are accepted as-is (usually freshly rendered).
     for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
         const root = JSON.parse(el.textContent);
-        const nodes = [].concat(root["@graph"] || root);
-        for (const node of nodes) {
+        for (const node of [].concat(root["@graph"] || root)) {
           if (!/TVEpisode|Episode/i.test(node["@type"] || "")) continue;
           const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
           const title  = (node.name || "").trim();
           if (!series || !title) continue;
-
-          // Reject obviously stale entries: ld.url present but pointing to
-          // a different page than the one we're on right now.
           const ldUrl = (node.url || "").trim();
           if (ldUrl && !pathsMatch(ldUrl, here)) continue;
-
-          candidates.push({
+          const meta = {
             series,
             season:  parseInt(node.partOfSeason?.seasonNumber, 10) || 1,
             episode: parseInt(node.episodeNumber, 10) || 1,
             title,
-          });
+          };
+          metaCache = meta; metaCacheUrl = here;
+          return meta;
         }
       } catch {}
     }
 
-    // 2. Page title / og:title fallbacks
-    const titles = [
+    // ── Source 2: og:title / document.title ───────────────────────────────────
+    // These tags update immediately on SPA navigation so they're always fresh.
+    for (const raw of [
       document.querySelector('meta[property="og:title"]')?.content || "",
       document.title,
-    ];
-    for (const raw of titles) {
-      const s = raw
-        .replace(/\s*\|\s*[^|]+$/, "")
-        .replace(/^Watch\s+/i, "")
-        .trim();
-
+    ]) {
+      const s = raw.replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").trim();
       let m = s.match(/^(.+?)\s+(?:Season\s+(\d+)\s+)?Episode\s+(\d+)\s*[-–]\s*(.+)$/i);
-      if (m) candidates.push({ series: m[1].trim(), season: parseInt(m[2], 10) || 1,
-                                episode: parseInt(m[3], 10), title: m[4].trim() });
-
+      if (m) {
+        const meta = { series: m[1].trim(), season: parseInt(m[2], 10) || 1,
+                       episode: parseInt(m[3], 10), title: m[4].trim() };
+        metaCache = meta; metaCacheUrl = here; return meta;
+      }
       m = s.match(/^(.+?)\s*-\s*S(\d+)\s*E(\d+)\s*[-–]\s*(.+)$/i);
-      if (m) candidates.push({ series: m[1].trim(), season: parseInt(m[2], 10),
-                                episode: parseInt(m[3], 10), title: m[4].trim() });
-    }
-
-    // Return + cache the first candidate that survives the cross-check.
-    for (const c of candidates) {
-      if (verifyMetadataMatches(c)) {
-        metaCache = c;
-        metaCacheUrl = here;
-        return c;
+      if (m) {
+        const meta = { series: m[1].trim(), season: parseInt(m[2], 10),
+                       episode: parseInt(m[3], 10), title: m[4].trim() };
+        metaCache = meta; metaCacheUrl = here; return meta;
       }
     }
+
+    // ── Source 3: URL slug — always reflects the current page ─────────────────
+    const slugMeta = parseUrlSlugMeta();
+    if (slugMeta) { metaCache = slugMeta; metaCacheUrl = here; return slugMeta; }
+
     return null;
   }
 
@@ -513,26 +487,23 @@
 
   // Build the human-readable download filename.
   // Target format: Chainsaw Man_S01E01_DOG & CHAINSAW - English [CC].vtt
+  // Always produces the formatted name — getEpisodeMetadata() guarantees a
+  // result via the URL-slug fallback, so the raw server filename is never used.
   function buildFilename(entry) {
     const meta = getEpisodeMetadata();
-    const lang = entry.hlsLabel || entry.trackLabel || "";
+    const lang = sanitizeName(entry.hlsLabel || entry.trackLabel || "English [CC]");
 
-    if (meta && meta.series && meta.title) {
+    if (meta) {
       const series  = sanitizeName(meta.series);
-      const season  = String(meta.season).padStart(2, "0");
-      const episode = String(meta.episode).padStart(2, "0");
+      const season  = String(meta.season  || 1).padStart(2, "0");
+      const episode = String(meta.episode || 1).padStart(2, "0");
       const title   = sanitizeName(cleanTitle(meta.title));
-      const suffix  = lang ? ` - ${sanitizeName(lang)}` : "";
-      return `${series}_S${season}E${episode}_${title}${suffix}.vtt`;
+      return `${series}_S${season}E${episode}_${title} - ${lang}.vtt`;
     }
 
-    // Fallback: append language to the raw filename if we have it
-    if (lang) {
-      const base = (entry.filename || "subtitles").replace(/\.vtt$/i, "");
-      return `${sanitizeName(base)} - ${sanitizeName(lang)}.vtt`;
-    }
-
-    return entry.filename || "subtitles.vtt";
+    // Genuine last resort (no URL slug match either): raw filename + language.
+    const base = (entry.filename || "subtitles").replace(/\.vtt$/i, "");
+    return `${sanitizeName(base)} - ${lang}.vtt`;
   }
 
   function scanDOM() {
@@ -1003,30 +974,22 @@
     return foundVtts.size > 0 ? [...foundVtts.values()] : null;
   }
 
-  // Wait separately for page metadata (JSON-LD / title) to be ready AND match.
-  // Crunchyroll client-side renders JSON-LD, so it can lag behind VTT detection.
-  // Also: if a cached value no longer verifies (e.g. URL changed mid-await),
-  // invalidate it so the next iteration re-extracts from the fresh DOM.
+  // Wait for episode metadata to become available on the current page.
+  // Polls until JSON-LD or page-title data appears; the URL-slug fallback in
+  // getEpisodeMetadata() means this almost always returns something.
   async function waitForMetadata(timeoutMs = 15000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (seasonStop) return null;
-
-      // Defensive: if cached metadata exists but no longer matches the current
-      // page (URL or document title changed), throw it out.
-      if (metaCache && (metaCacheUrl !== location.href || !verifyMetadataMatches(metaCache))) {
+      if (metaCache && metaCacheUrl !== location.href) {
         metaCache = null;
         metaCacheUrl = null;
       }
-
       const m = getEpisodeMetadata();
-      if (m && verifyMetadataMatches(m)) return m;
+      if (m) return m;
       await sleep(400);
     }
-    // Last-ditch return — only if it still verifies; otherwise null so the
-    // caller can decide to skip / retry / fall back to the raw filename.
-    const m = getEpisodeMetadata();
-    return m && verifyMetadataMatches(m) ? m : null;
+    return getEpisodeMetadata();
   }
 
   async function tryAutoplay() {
@@ -1049,13 +1012,7 @@
 
   // Wait for the current download to feasibly finish before navigating away.
   async function downloadAndWait(entry) {
-    // Wait for metadata that actually matches the current page. waitForMetadata
-    // returns null if it never verifies — surface that so the user knows
-    // something's off rather than silently saving with the wrong/raw name.
-    const meta = await waitForMetadata(15000);
-    if (seasonActive && !meta) {
-      setBanner("⚠️ Couldn't verify episode metadata — saving with fallback name.");
-    }
+    await waitForMetadata(15000);
     const filename = buildFilename(entry);
     const fakeBtn = { textContent: "", classList: { add: () => {}, remove: () => {} } };
     if (entry.isHls)       await downloadHls({ ...entry, filename }, fakeBtn);
