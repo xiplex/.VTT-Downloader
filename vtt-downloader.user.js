@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.12.0
+// @version      1.13.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1041,6 +1041,9 @@
     seasonCount = 0;
     updateUI();
 
+    // Track every URL we've downloaded so we stop if the "next" link cycles back.
+    const visitedUrls = new Set([location.href]);
+
     // Ensure the player is running so Crunchyroll renders JSON-LD and updates
     // document.title before we try to read episode metadata for episode 1.
     await tryAutoplay();
@@ -1091,6 +1094,13 @@
         setBanner(`🏁 Navigation didn't happen — stopping. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
         break;
       }
+
+      // Stop if we've already downloaded this URL — means the playlist cycled back.
+      if (visitedUrls.has(location.href)) {
+        setBanner(`🏁 Reached end of season. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        break;
+      }
+      visitedUrls.add(location.href);
 
       // Give the page a moment to clear state
       await sleep(2500);
