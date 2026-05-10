@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.13.0
+// @version      1.14.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -497,7 +497,11 @@
       const series  = sanitizeName(meta.series);
       const season  = String(meta.season  || 1).padStart(2, "0");
       const episode = String(meta.episode || 1).padStart(2, "0");
-      const title   = sanitizeName(cleanTitle(meta.title));
+      // Strip series name prefix if Crunchyroll baked it into the episode title
+      // e.g. "Chainsaw Man - Dog & Chainsaw" → "Dog & Chainsaw"
+      let title = sanitizeName(cleanTitle(meta.title));
+      const seriesEsc = series.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      title = title.replace(new RegExp(`^${seriesEsc}\\s*[-–:]\\s*`, "i"), "").trim() || title;
       return `${series}_S${season}E${episode}_${title} - ${lang}.vtt`;
     }
 
