@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.18.0
+// @version      1.19.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -374,7 +374,13 @@
   function cleanEpisodeTitle(raw, series) {
     if (!raw) return "";
     let t = raw.trim();
-    // Strip series-name prefix first (e.g. "DAN DA DAN – That's How...")
+
+    // "DAN DA DAN Season 2 (English Dub) | E23 - Hey, it's a Kaiju"
+    // The title lives after the pipe + episode marker.
+    const pipeM = t.match(/\|\s*Ep?\.?\s*\d+\s*[-–]\s*(.+)$/i);
+    if (pipeM) return pipeM[1].trim();
+
+    // Strip series-name prefix (e.g. "Chainsaw Man – Dog & Chainsaw" → "Dog & Chainsaw")
     if (series) {
       const esc = series.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       t = t.replace(new RegExp(`^${esc}\\s*[-–:,]\\s*`, "i"), "").trim();
@@ -400,14 +406,29 @@
   //   "Watch Series – E5 – Title | Crunchyroll"   (short format)
   //   "Watch Series - S1E5 – Title | Crunchyroll"
   function parseTitleString(raw) {
-    const s = raw
-      .replace(/\s*\|\s*[^|]+$/, "")   // drop "| Crunchyroll" suffix
-      .replace(/^Watch\s+/i, "")        // drop "Watch " prefix
-      .replace(/\s+Online\s*$/i, "")    // drop trailing "Online"
+    const base = raw.replace(/^Watch\s+/i, "").trim();
+
+    // "DAN DA DAN Season 2 (English Dub) | E23 - Hey, it's a Kaiju"
+    // Must be checked BEFORE the generic pipe-strip below eats the episode info.
+    let m = base.match(/^(.+?)\s*\|\s*Ep?\.?\s*(\d+)\s*[-–]\s*(.+?)(?:\s*\|.*)?$/i);
+    if (m) {
+      const seriesFull = m[1].trim();
+      const seasonM    = seriesFull.match(/\bSeason\s+(\d+)\b/i);
+      const series     = seriesFull.replace(/\s*\bSeason\s+\d+\b.*/i, "").trim();
+      const title      = m[3].trim();
+      if (series && title && title.toLowerCase() !== series.toLowerCase()) {
+        return { series, season: seasonM ? +seasonM[1] : 1, episode: +m[2], title };
+      }
+    }
+
+    // Strip site suffix, "Watch" prefix, and noise for remaining patterns
+    const s = base
+      .replace(/\s*\|\s*[^|]+$/, "")              // drop "| Crunchyroll"
+      .replace(/\s*-\s*Watch\s+on\s+\S+\s*$/i, "") // drop "- Watch on Crunchyroll"
+      .replace(/\s+Online\s*$/i, "")
       .trim();
     if (!s) return null;
 
-    let m;
     // "Series Season 2 Episode 5 – Title"
     m = s.match(/^(.+?)\s+Season\s+(\d+)\s+Episode\s+(\d+)\s*[-–:]\s*(.+)$/i);
     if (m) return { series: m[1].trim(), season: +m[2], episode: +m[3], title: m[4].trim() };
@@ -486,6 +507,24 @@
           if (!jsonLDBase) jsonLDBase = { series, season, episode };
         }
       } catch {}
+    }
+
+    // ── Source 3b: VideoObject JSON-LD ────────────────────────────────────────
+    // Crunchyroll includes a second JSON-LD block typed "VideoObject" whose
+    // "name" field contains the clean episode title (no series prefix, no ep#).
+    if (jsonLDBase) {
+      for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+          const root = JSON.parse(el.textContent);
+          if (root["@type"] === "VideoObject" && root.name) {
+            const title = root.name.trim();
+            if (notSameAsSeries(title, jsonLDBase.series)) {
+              const meta = { ...jsonLDBase, title };
+              metaCache = meta; metaCacheUrl = here; return meta;
+            }
+          }
+        } catch {}
+      }
     }
 
     // ── Source 4: innerText scan using the ep# we got from JSON-LD ────────────
