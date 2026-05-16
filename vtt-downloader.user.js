@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.17.0
+// @version      1.18.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -432,87 +432,111 @@
     if (metaCache) return metaCache;
 
     const here = location.href;
+    const notSameAsSeries = (title, series) =>
+      !!title && title.trim().toLowerCase() !== series.trim().toLowerCase();
 
-    // ── Source 1: og:title / document.title / twitter:title ───────────────────
-    // Always reflects the current SPA route — never stale.
+    // ── Source 1: og:title / twitter:title / document.title ───────────────────
     for (const raw of [
       document.querySelector('meta[property="og:title"]')?.content || "",
       document.querySelector('meta[name="twitter:title"]')?.content || "",
       document.title,
     ]) {
       const m = parseTitleString(raw);
-      if (m && m.title && m.title.toLowerCase() !== m.series.toLowerCase()) {
+      if (m && notSameAsSeries(m.title, m.series)) {
         metaCache = m; metaCacheUrl = here; return m;
       }
     }
 
     // ── Source 2: meta[name="description"] ────────────────────────────────────
-    // Crunchyroll descriptions often read:
-    //   "Watch Series Episode N, Episode Title on Crunchyroll. Plot text…"
-    //   "Watch Series – E1 – Episode Title on Crunchyroll."
     const desc = (document.querySelector('meta[name="description"]')?.content || "").trim();
-    if (desc) {
-      let m = desc.match(/Watch\s+(.+?)\s+Episode\s+(\d+)[,\s–-]+(.+?)\s+on\s+Crunchyroll/i);
-      if (m && m[3].trim().toLowerCase() !== m[1].trim().toLowerCase()) {
-        const meta = { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
-        metaCache = meta; metaCacheUrl = here; return meta;
-      }
-      m = desc.match(/Watch\s+(.+?)\s*[-–]\s*Ep?\.?\s*(\d+)\s*[-–:]\s*(.+?)\s+on\s+Crunchyroll/i);
-      if (m && m[3].trim().toLowerCase() !== m[1].trim().toLowerCase()) {
+    for (const pat of [
+      /Watch\s+(.+?)\s+Episode\s+(\d+)[,\s–\-]+(.+?)\s+on\s+Crunchyroll/i,
+      /Watch\s+(.+?)\s*[-–]\s*Ep?\.?\s*(\d+)\s*[-–:]\s*(.+?)\s+on\s+Crunchyroll/i,
+    ]) {
+      const m = desc.match(pat);
+      if (m && notSameAsSeries(m[3], m[1])) {
         const meta = { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
         metaCache = meta; metaCacheUrl = here; return meta;
       }
     }
 
-    // ── Source 3: JSON-LD TVEpisode ────────────────────────────────────────────
-    // Has structured season/episode numbers; episode title needs cleaning.
+    // ── Source 3: JSON-LD — collect ep data even when title equals series name ─
+    let jsonLDBase = null; // { series, season, episode } — used by sources 4 & 5
     for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
         const root = JSON.parse(el.textContent);
         for (const node of [].concat(root?.["@graph"] || root)) {
           if (!/TVEpisode|Episode/i.test(node["@type"] || "")) continue;
           const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
-          const rawTitle = (node.name || "").trim();
-          if (!series || !rawTitle) continue;
+          if (!series) continue;
           const ldUrl = (node.url || "").trim();
           if (ldUrl && !pathsMatch(ldUrl, here)) continue;
-          const title = cleanEpisodeTitle(rawTitle, series);
-          if (!title || title.toLowerCase() === series.toLowerCase()) continue;
-          const meta = {
-            series,
-            season:  parseInt(node.partOfSeason?.seasonNumber, 10) || 1,
-            episode: parseInt(node.episodeNumber, 10) || 1,
-            title,
-          };
-          metaCache = meta; metaCacheUrl = here; return meta;
+          const episode = parseInt(node.episodeNumber, 10) || 1;
+          const season  = parseInt(node.partOfSeason?.seasonNumber, 10) || 1;
+          // Try cleaned title — return immediately if it's genuinely different
+          const rawTitle = (node.name || "").trim();
+          if (rawTitle) {
+            const title = cleanEpisodeTitle(rawTitle, series);
+            if (notSameAsSeries(title, series)) {
+              const meta = { series, season, episode, title };
+              metaCache = meta; metaCacheUrl = here; return meta;
+            }
+          }
+          // Title was bad but ep# / series are still useful
+          if (!jsonLDBase) jsonLDBase = { series, season, episode };
         }
       } catch {}
     }
 
-    // ── Source 4: DOM heading scan ─────────────────────────────────────────────
-    // The episode title is displayed on screen as "E1 – That's How Love Starts…"
-    // Scan heading-level elements for this pattern as a last resort.
-    const seriesFromOg = (
-      document.querySelector('meta[property="og:title"]')?.content || document.title || ""
-    ).replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").replace(/\s*[-–].*$/, "").trim();
-
-    for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,p,[class*="title"],[class*="episode"]')) {
-      const text = (el.textContent || "").trim();
-      if (text.length < 4 || text.length > 120) continue;
-      const m = text.match(/^Ep?(?:isode)?\s*\.?\s*(\d+)\s*[-–:]\s*(.{3,})$/i);
-      if (!m) continue;
-      const title = m[2].trim();
-      if (!seriesFromOg || title.toLowerCase() === seriesFromOg.toLowerCase()) continue;
-      const meta = { series: seriesFromOg, season: 1, episode: +m[1], title };
-      metaCache = meta; metaCacheUrl = here; return meta;
+    // ── Source 4: innerText scan using the ep# we got from JSON-LD ────────────
+    // The episode title is visible on screen as "E1 – That's How Love Starts…"
+    // document.body.innerText gives us every rendered line, so we search for the
+    // specific episode number to avoid matching sidebar entries for other episodes.
+    if (jsonLDBase) {
+      try {
+        const pageText = document.body?.innerText || "";
+        const n = jsonLDBase.episode;
+        for (const pat of [
+          new RegExp(`(?:^|\\n)\\s*E0*${n}\\s*[-–]\\s*(.{3,100})(?=\\r?\\n|$)`, "im"),
+          new RegExp(`(?:^|\\n)\\s*Episode\\s+0*${n}\\s*[-–:]\\s*(.{3,100})(?=\\r?\\n|$)`, "im"),
+        ]) {
+          const m = pageText.match(pat);
+          if (!m) continue;
+          const title = m[1].trim();
+          if (notSameAsSeries(title, jsonLDBase.series)) {
+            const meta = { ...jsonLDBase, title };
+            metaCache = meta; metaCacheUrl = here; return meta;
+          }
+        }
+      } catch {}
     }
 
-    // Log what we found so the issue can be diagnosed from the DevTools console.
+    // ── Source 5: URL slug with normalized series-name comparison ──────────────
+    // Normalize to lowercase alphanumeric so "DAN DA DAN" == "dan-da-dan".
+    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const slugM = location.pathname.match(/\/watch\/[^/]+\/([^/?#]+)/i);
+    if (slugM) {
+      const slug = slugM[1];
+      const series = jsonLDBase?.series || (
+        (document.querySelector('meta[property="og:title"]')?.content || document.title || "")
+          .replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").replace(/\s*[-–].*$/, "").trim()
+      );
+      if (series && norm(slug) !== norm(series)) {
+        const title = slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+        if (notSameAsSeries(title, series)) {
+          const meta = { series, season: jsonLDBase?.season || 1,
+                         episode: jsonLDBase?.episode || 1, title };
+          metaCache = meta; metaCacheUrl = here; return meta;
+        }
+      }
+    }
+
     console.debug(
       "[VTT Downloader] metadata extraction failed\n",
       " og:title:", document.querySelector('meta[property="og:title"]')?.content, "\n",
       " doc title:", document.title, "\n",
       " description:", (document.querySelector('meta[name="description"]')?.content || "").slice(0, 200),
+      "\n jsonLDBase:", jsonLDBase,
     );
     return null;
   }
