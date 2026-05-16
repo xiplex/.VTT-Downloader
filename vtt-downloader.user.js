@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.19.0
+// @version      1.20.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -399,6 +399,17 @@
     return t || raw.trim();
   }
 
+  // Strip streaming/release qualifiers that Crunchyroll appends to series names
+  // so they don't bleed into the filename.
+  // e.g. "DAN DA DAN (English Dub)" → "DAN DA DAN"
+  //      "Chainsaw Man Season 2 (Uncensored)" → "Chainsaw Man"
+  function cleanSeriesName(s) {
+    return (s || "")
+      .replace(/\s*\(\s*(?:English\s+)?(?:Dub(?:bed)?|Sub(?:titled)?|Uncensored|Censored|Audio)\s*\)/gi, "")
+      .replace(/\s*\bSeason\s+\d+\b.*/i, "")
+      .trim();
+  }
+
   // Parse an og:title or document.title string into episode metadata.
   // Covers the main formats Crunchyroll uses:
   //   "Watch Series Season 2 Episode 5 – Title | Crunchyroll"
@@ -414,7 +425,7 @@
     if (m) {
       const seriesFull = m[1].trim();
       const seasonM    = seriesFull.match(/\bSeason\s+(\d+)\b/i);
-      const series     = seriesFull.replace(/\s*\bSeason\s+\d+\b.*/i, "").trim();
+      const series     = cleanSeriesName(seriesFull);
       const title      = m[3].trim();
       if (series && title && title.toLowerCase() !== series.toLowerCase()) {
         return { series, season: seasonM ? +seasonM[1] : 1, episode: +m[2], title };
@@ -556,7 +567,7 @@
     const slugM = location.pathname.match(/\/watch\/[^/]+\/([^/?#]+)/i);
     if (slugM) {
       const slug = slugM[1];
-      const series = jsonLDBase?.series || (
+      const series = jsonLDBase?.series || cleanSeriesName(
         (document.querySelector('meta[property="og:title"]')?.content || document.title || "")
           .replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").replace(/\s*[-–].*$/, "").trim()
       );
