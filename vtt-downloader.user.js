@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.20.0
+// @version      1.21.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -121,19 +121,25 @@
   function isEnglishCC(label) {
     if (!label) return false;
     const l = String(label).toLowerCase();
-    const isEnglish = /\benglish\b|\beng\b|\b(?:en|en-us|en-gb)\b/.test(l);
+    // Accept English language codes with or without a separator: en, eng,
+    // english, en-us, en_us, en-gb, and the joined forms enus / engb.
+    const isEnglish = /\benglish\b|\beng\b|\ben(?:us|gb)?\b|\ben[-_](?:us|gb)\b/.test(l);
     const hasCC = /\[\s*cc\s*\]|\(\s*cc\s*\)|\bcc\b|closed[\s-]*caption|\bsdh\b/.test(l);
     return isEnglish && hasCC;
   }
 
-  // URL-only hint check for cases where no label is available.
+  // URL-only hint check for cases where no track label is available.
+  // Crunchyroll's DASH CDN serves the closed-caption track at paths like
+  //   /clean/captions/enus/<timestamp>/caption.vtt
+  // — a language code with no separator ("enus"/"engb") inside a /captions/
+  // folder — so recognise those alongside the older "en-us"/"[cc]" forms.
   function urlSuggestsEnglishCC(url) {
     if (!url) return false;
     try {
       const u = new URL(url, location.href);
       const path = (u.pathname + " " + u.search).toLowerCase();
-      const isEnglish = /(^|[^a-z])(en|eng|english|en[-_]us|en[-_]gb)([^a-z]|$)/.test(path);
-      const hasCC = /(^|[^a-z])(cc|caption|captions|sdh)([^a-z]|$)/.test(path);
+      const isEnglish = /(^|[^a-z])en(?:g|us|gb|glish)?(?:[-_](?:us|gb))?([^a-z]|$)/.test(path);
+      const hasCC = /(^|[^a-z])(cc|captions?|sdh)([^a-z]|$)/.test(path) || /\/captions?\//.test(path);
       return isEnglish && hasCC;
     } catch {
       return false;
@@ -622,7 +628,7 @@
       const trackKind  = el.kind || el.getAttribute("kind") || "";
       // Only allow English [CC] — match label, or "captions" kind + English srclang
       const labelMatch = isEnglishCC(`${trackLabel} ${trackLang}`);
-      const kindMatch  = trackKind === "captions" && /^en\b/i.test(trackLang);
+      const kindMatch  = trackKind === "captions" && /^en(?:g|us|gb|glish|[-_])?/i.test(trackLang);
       if (!labelMatch && !kindMatch) return;
       if (url && isVttUrl(url)) reportVtt(url, "track", { trackLabel: trackLabel || "English [CC]" });
     });
