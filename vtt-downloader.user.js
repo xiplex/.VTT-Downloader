@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.22.0
+// @version      1.23.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1106,6 +1106,7 @@
   // Try a list of selectors / strategies to find Crunchyroll's "next episode" trigger.
   function findNextEpisodeTarget() {
     const selectors = [
+      '[data-testid="skip-to-next-episode-button"]',
       '[data-t="next-episode-button"]',
       '[data-testid="next-episode-button"]',
       '[data-testid="next-episode"]',
@@ -1144,6 +1145,64 @@
     }
 
     return null;
+  }
+
+  // Find the episode-list link for episode (current + 1).  This works even when
+  // the player's "Next Episode" overlay isn't showing — which is common here,
+  // since we only download subtitles and never play the video to the end.
+  function findNextEpisodeLinkByNumber() {
+    const meta = getEpisodeMetadata();
+    if (!meta || !meta.episode) return null;
+    const nextNum = meta.episode + 1;
+    // Match "E12", "Episode 12", "EP 12" — but not "E120"/"E121" (digit boundary).
+    const rxs = [
+      new RegExp(`(^|[^0-9])E0*${nextNum}([^0-9]|$)`, "i"),
+      new RegExp(`\\bEpisode\\s+0*${nextNum}([^0-9]|$)`, "i"),
+      new RegExp(`\\bEp\\.?\\s*0*${nextNum}([^0-9]|$)`, "i"),
+    ];
+    const here = location.href;
+    for (const a of document.querySelectorAll('a[href*="/watch/"]')) {
+      const href = a.getAttribute("href");
+      if (!href) continue;
+      try { if (new URL(href, here).href === here) continue; } catch {}
+      const text = (a.getAttribute("aria-label") || a.textContent || "").trim();
+      if (text && rxs.some((rx) => rx.test(text))) return a;
+    }
+    return null;
+  }
+
+  // Dispatch a full, realistic click sequence — some SPA controls ignore a bare
+  // element.click() (they listen for pointer/mouse events), so send those too.
+  function dispatchRealClick(el) {
+    if (!el) return;
+    try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+    const opts = { bubbles: true, cancelable: true, view: window };
+    for (const type of ["pointerover", "pointerenter", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      try { el.dispatchEvent(new MouseEvent(type, opts)); } catch {}
+    }
+    try { el.click(); } catch {}
+  }
+
+  // Advance to the next episode using SPA (soft) navigation so this loop keeps
+  // running.  Tries several targets, clicking each realistically and retrying,
+  // rather than clicking once and giving up on the first timeout.
+  async function goToNextEpisode(oldUrl) {
+    const candidates = [];
+    const seen = new Set();
+    const add = (el) => { if (el && !seen.has(el)) { seen.add(el); candidates.push(el); } };
+    add(findNextEpisodeTarget());        // player "Next Episode" control (if present)
+    add(findNextEpisodeLinkByNumber());  // episode-list link for ep N+1 (usually present)
+
+    if (candidates.length === 0) return false;
+
+    for (const el of candidates) {
+      for (let attempt = 0; attempt < 2 && !seasonStop; attempt++) {
+        dispatchRealClick(el);
+        if (await waitForUrlChange(oldUrl, attempt === 0 ? 12000 : 6000)) return true;
+      }
+      if (seasonStop) return false;
+    }
+    return false;
   }
 
   async function waitForUrlChange(oldUrl, timeoutMs) {
@@ -1288,18 +1347,10 @@
 
       setBanner(`🔎 Looking for next episode…`);
 
-      const target = findNextEpisodeTarget();
-      if (!target) {
-        setBanner(`🏁 Done — no next-episode link found. ${summary()}`);
-        break;
-      }
-
       const oldUrl = location.href;
-      try { target.click(); } catch {}
-
-      const navigated = await waitForUrlChange(oldUrl, 15000);
+      const navigated = await goToNextEpisode(oldUrl);
       if (!navigated) {
-        setBanner(`🏁 Navigation didn't happen — stopping. ${summary()}`);
+        setBanner(`🏁 Couldn't reach the next episode automatically — click it once to continue. ${summary()}`);
         break;
       }
 
