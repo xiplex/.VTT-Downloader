@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.21.0
+// @version      1.22.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
@@ -39,6 +41,61 @@
   let seasonActive = false;
   let seasonStop = false;
   let seasonCount = 0;
+
+  // ── Download history ───────────────────────────────────────────────────────
+  // Persist which episodes have already been downloaded so repeat runs — and the
+  // Season auto-downloader — can skip duplicates.  Stored via Tampermonkey so the
+  // record survives page reloads and browser restarts.
+  const DL_HISTORY_KEY = "vtt_downloaded_episodes";
+  let downloadedEpisodes = new Set();
+  try {
+    if (typeof GM_getValue === "function") {
+      const arr = JSON.parse(GM_getValue(DL_HISTORY_KEY, "[]"));
+      if (Array.isArray(arr)) downloadedEpisodes = new Set(arr);
+    }
+  } catch {}
+
+  function persistHistory() {
+    try {
+      if (typeof GM_setValue === "function") {
+        GM_setValue(DL_HISTORY_KEY, JSON.stringify([...downloadedEpisodes]));
+      }
+    } catch {}
+  }
+
+  // Stable per-episode identity: prefer series + season + episode from metadata,
+  // falling back to the episode's URL path (unique per Crunchyroll episode) when
+  // metadata isn't available yet.
+  function episodeKey(entry) {
+    const meta = getEpisodeMetadata();
+    if (meta) {
+      const s  = sanitizeName(meta.series).toLowerCase();
+      const se = String(meta.season  || 1).padStart(2, "0");
+      const ep = String(meta.episode || 1).padStart(2, "0");
+      if (s) return `ep:${s}|s${se}e${ep}`;
+    }
+    try { return "url:" + new URL((entry && entry.url) || location.href, location.href).pathname.toLowerCase(); }
+    catch { return "url:" + ((entry && entry.url) || location.href); }
+  }
+
+  function isDownloaded(entry) {
+    return downloadedEpisodes.has(episodeKey(entry));
+  }
+
+  function markDownloaded(keyOrEntry) {
+    const key = typeof keyOrEntry === "string" ? keyOrEntry : episodeKey(keyOrEntry);
+    if (key && !downloadedEpisodes.has(key)) {
+      downloadedEpisodes.add(key);
+      persistHistory();
+      if (isTopFrame) updateUI();
+    }
+  }
+
+  function clearHistory() {
+    downloadedEpisodes.clear();
+    persistHistory();
+    if (isTopFrame) updateUI();
+  }
 
   // Report a found VTT — bubble up from iframes to the top frame's UI
   function reportVtt(url, source, extra) {
@@ -725,6 +782,9 @@
     .vdp-tag  { display: inline-block !important; background: #1e3a5f !important; color: #60a5fa !important; border-radius: 4px !important; padding: 1px 4px !important; font-size: 9px !important; font-weight: 700 !important; margin-right: 4px !important; text-transform: uppercase !important; }
     .vdp-tag.hls  { background: #1c3a2a !important; color: #4ade80 !important; }
     .vdp-tag.blob { background: #3a1c3a !important; color: #e879f9 !important; }
+    .vdp-tag.done { background: #14321f !important; color: #4ade80 !important; margin-right: 4px !important; }
+    .vdp-clearlink { cursor: pointer !important; text-decoration: underline !important; color: #a5b4fc !important; }
+    .vdp-clearlink:hover { color: #c7d2fe !important; }
 
     .vdp-btn { all: initial !important; border: 1px solid #2563eb !important; color: #2563eb !important; border-radius: 5px !important; padding: 4px 9px !important; font-size: 10px !important; font-weight: 600 !important; cursor: pointer !important; white-space: nowrap !important; flex-shrink: 0 !important; font-family: inherit !important; transition: background 0.1s !important; }
     .vdp-btn:hover { background: #2563eb !important; color: #fff !important; }
@@ -785,6 +845,17 @@
 
     document.getElementById("vtt-dl-season").addEventListener("click", toggleSeasonDownload);
 
+    // Delegated: the "clear history" link is re-rendered on each updateUI().
+    panel.addEventListener("click", (e) => {
+      const t = e.target;
+      if (t && t.id === "vtt-dl-clear") {
+        const n = downloadedEpisodes.size;
+        if (confirm(`Forget the record of ${n} already-downloaded episode${n !== 1 ? "s" : ""}?\n\nThey can then be downloaded again.`)) {
+          clearHistory();
+        }
+      }
+    });
+
     uiReady = true;
     updateUI();
   }
@@ -804,7 +875,13 @@
 
     const countEl = document.getElementById("vtt-dl-count");
     const dlAll   = document.getElementById("vtt-dl-all");
-    if (countEl) countEl.textContent = count > 0 ? `${count} VTT file${count !== 1 ? "s" : ""} found` : "No VTT files yet";
+    if (countEl) {
+      const base = count > 0 ? `${count} VTT file${count !== 1 ? "s" : ""} found` : "No VTT files yet";
+      const hist = downloadedEpisodes.size;
+      countEl.innerHTML = base + (hist
+        ? ` · <span id="vtt-dl-clear" class="vdp-clearlink" title="Forget the record of episodes already downloaded">history: ${hist} ✕</span>`
+        : "");
+    }
     if (dlAll)   dlAll.disabled = count === 0;
     const dlSeason = document.getElementById("vtt-dl-season");
     if (dlSeason) {
@@ -825,6 +902,7 @@
     for (const entry of foundVtts.values()) {
       const { url, source, isHls, isBlob } = entry;
       const displayName = buildFilename(entry);
+      const done = isDownloaded(entry);
       const item = document.createElement("div");
       item.className = "vdp-item";
 
@@ -836,12 +914,12 @@
       info.className = "vdp-info";
       info.innerHTML = `
         <div class="vdp-name" title="${url}">${displayName}</div>
-        <div class="vdp-src"><span class="vdp-tag ${tagClass}">${tagLabel}</span>${host}</div>
+        <div class="vdp-src"><span class="vdp-tag ${tagClass}">${tagLabel}</span>${done ? '<span class="vdp-tag done">✓ downloaded</span>' : ""}${host}</div>
       `;
 
       const btn = document.createElement("button");
-      btn.className = "vdp-btn";
-      btn.textContent = "Download";
+      btn.className = "vdp-btn" + (done ? " done" : "");
+      btn.textContent = done ? "Re-download" : "Download";
       btn.addEventListener("click", () => triggerItemDownload(entry, btn));
 
       item.appendChild(info);
@@ -855,19 +933,20 @@
   function triggerItemDownload(entry, btn) {
     // Build the formatted filename at click time so page metadata is fully loaded
     const filename = buildFilename(entry);
+    const onDone = () => markDownloaded(entry);
     if (entry.isHls) {
-      downloadHls({ ...entry, filename }, btn);
+      downloadHls({ ...entry, filename }, btn, onDone);
     } else if (entry.isBlob) {
-      downloadBlobVtt({ ...entry, filename }, btn);
+      downloadBlobVtt({ ...entry, filename }, btn, onDone);
     } else {
-      downloadDirect(entry.url, filename, btn);
+      downloadDirect(entry.url, filename, btn, onDone);
     }
   }
 
   // Cross-origin URLs make browsers ignore the anchor `download` attribute,
   // so we fetch the VTT body and re-save it as a same-origin blob — that way
   // our chosen filename is actually honored.
-  async function downloadDirect(url, filename, btn) {
+  async function downloadDirect(url, filename, btn, onDone) {
     if (btn) { btn.textContent = "⏳ Fetching…"; btn.classList.add("busy"); }
 
     // 1. Try regular fetch (works if the page already has CORS access)
@@ -876,7 +955,7 @@
       if (resp.status === 429) throw new Error("Rate limited (429) — wait a moment before continuing");
       if (resp.ok) {
         const text = await resp.text();
-        saveTextAsVtt(text, filename, btn);
+        saveTextAsVtt(text, filename, btn, onDone);
         return;
       }
     } catch (e) {
@@ -890,40 +969,40 @@
         url,
         onload: (resp) => {
           if (resp.status >= 200 && resp.status < 300 && resp.responseText) {
-            saveTextAsVtt(resp.responseText, filename, btn);
+            saveTextAsVtt(resp.responseText, filename, btn, onDone);
           } else {
-            tryGmDownload(url, filename, btn);
+            tryGmDownload(url, filename, btn, onDone);
           }
         },
-        onerror: () => tryGmDownload(url, filename, btn),
+        onerror: () => tryGmDownload(url, filename, btn, onDone),
       });
       return;
     }
 
     // 3. Last resort
-    tryGmDownload(url, filename, btn);
+    tryGmDownload(url, filename, btn, onDone);
   }
 
-  function tryGmDownload(url, filename, btn) {
+  function tryGmDownload(url, filename, btn, onDone) {
     if (typeof GM_download !== "undefined") {
       GM_download({
         url,
         name: filename,
-        onload: () => { if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); } },
-        onerror: () => fallbackDownload(url, filename, btn),
+        onload: () => { if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); } if (onDone) onDone(); },
+        onerror: () => fallbackDownload(url, filename, btn, onDone),
       });
     } else {
-      fallbackDownload(url, filename, btn);
+      fallbackDownload(url, filename, btn, onDone);
     }
   }
 
-  function downloadBlobVtt(entry, btn) {
+  function downloadBlobVtt(entry, btn, onDone) {
     const text = entry.blobText || blobVttStore.get(entry.url);
     if (!text) { if (btn) { btn.textContent = "✗ Expired"; btn.classList.add("err"); } return; }
-    saveTextAsVtt(text, entry.filename, btn);
+    saveTextAsVtt(text, entry.filename, btn, onDone);
   }
 
-  async function downloadHls(entry, btn) {
+  async function downloadHls(entry, btn, onDone) {
     if (btn) { btn.textContent = "⏳ Fetching…"; btn.classList.add("busy"); }
     try {
       let segments = entry.hlsSegments;
@@ -944,7 +1023,7 @@
         const resp = await fetch(entry.url);
         const text = await resp.text();
         if (text.trimStart().startsWith("WEBVTT")) {
-          saveTextAsVtt(text, entry.filename, btn);
+          saveTextAsVtt(text, entry.filename, btn, onDone);
           return;
         }
         throw new Error("No segments found");
@@ -966,22 +1045,23 @@
         return s.replace(/^WEBVTT[^\r\n]*[\r\n]+(X-TIMESTAMP-MAP[^\r\n]*[\r\n]+)?[\r\n]*/i, "");
       }).join("\n\n");
 
-      saveTextAsVtt(merged, entry.filename, btn);
+      saveTextAsVtt(merged, entry.filename, btn, onDone);
     } catch (e) {
       console.error("[VTT Downloader] HLS merge failed:", e);
       if (btn) { btn.textContent = "✗ Failed"; btn.classList.remove("busy"); btn.classList.add("err"); }
     }
   }
 
-  function saveTextAsVtt(text, filename, btn) {
+  function saveTextAsVtt(text, filename, btn, onDone) {
     const blob = new Blob([text], { type: "text/vtt" });
     const url = origCreateObjectURL(blob);
     fallbackDownload(url, filename);
     setTimeout(() => origRevokeObjectURL(url), 5000);
     if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); }
+    if (onDone) onDone();
   }
 
-  function fallbackDownload(url, filename, btn) {
+  function fallbackDownload(url, filename, btn, onDone) {
     const a = document.createElement("a");
     a.href = url;
     a.download = filename;
@@ -990,6 +1070,7 @@
     a.click();
     document.body.removeChild(a);
     if (btn) { btn.textContent = "✓ Saved"; btn.classList.remove("busy"); btn.classList.add("done"); }
+    if (onDone) onDone();
   }
 
   // ── Season auto-download ───────────────────────────────────────────────────
@@ -1129,9 +1210,10 @@
     await waitForMetadata(15000);
     const filename = buildFilename(entry);
     const fakeBtn = { textContent: "", classList: { add: () => {}, remove: () => {} } };
-    if (entry.isHls)       await downloadHls({ ...entry, filename }, fakeBtn);
-    else if (entry.isBlob) downloadBlobVtt({ ...entry, filename }, fakeBtn);
-    else                   await downloadDirect(entry.url, filename, fakeBtn);
+    const onDone = () => markDownloaded(entry);
+    if (entry.isHls)       await downloadHls({ ...entry, filename }, fakeBtn, onDone);
+    else if (entry.isBlob) downloadBlobVtt({ ...entry, filename }, fakeBtn, onDone);
+    else                   await downloadDirect(entry.url, filename, fakeBtn, onDone);
     await sleep(1500);
   }
 
@@ -1164,39 +1246,51 @@
     await sleep(1500);
 
     let next = initial;
+    let skipped = 0;
+    const summary = () =>
+      `Downloaded ${seasonCount}${skipped ? `, skipped ${skipped} already-saved` : ""}.`;
 
     while (next && !seasonStop) {
-      seasonCount++;
+      // Make sure this episode's metadata is loaded before we identify it.
+      await waitForMetadata(15000);
       const meta = getEpisodeMetadata();
-      const epTitle = meta ? `${meta.series} S${String(meta.season).padStart(2, "0")}E${String(meta.episode).padStart(2, "0")}` : `Episode ${seasonCount}`;
-      setBanner(`⏳ Downloading <b>${epTitle}</b> (${preferLabel || "default track"})…`);
+      const epTitle = meta
+        ? `${meta.series} S${String(meta.season).padStart(2, "0")}E${String(meta.episode).padStart(2, "0")}`
+        : `Episode ${seasonCount + skipped + 1}`;
 
-      try {
-        await downloadAndWait(next);
-      } catch (e) {
-        const msg = e.message || String(e);
-        setBanner(`⚠️ ${msg}`);
-        if (msg.includes("429") || msg.toLowerCase().includes("rate limit")) {
-          setBanner(`🚫 Rate limited by server after ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}. Try again later.`);
-          break;
+      if (isDownloaded(next)) {
+        // Already grabbed on an earlier run — skip re-downloading it.
+        skipped++;
+        setBanner(`⏭ Already downloaded <b>${epTitle}</b> — skipping.`);
+        await sleep(900);
+      } else {
+        setBanner(`⏳ Downloading <b>${epTitle}</b> (${preferLabel || "default track"})…`);
+        try {
+          await downloadAndWait(next);
+          seasonCount++;
+        } catch (e) {
+          const msg = e.message || String(e);
+          setBanner(`⚠️ ${msg}`);
+          if (msg.includes("429") || msg.toLowerCase().includes("rate limit")) {
+            setBanner(`🚫 Rate limited by server after ${seasonCount} download${seasonCount !== 1 ? "s" : ""}. Try again later.`);
+            break;
+          }
+          await sleep(2000);
         }
-        await sleep(2000);
+        if (seasonStop) break;
+        setBanner(`✅ Saved ${epTitle}. Pausing before next episode…`);
+        // Brief jittered pause — keeps request cadence human-paced and
+        // reduces any chance of triggering Crunchyroll's rate limiter.
+        await sleep(2000 + Math.random() * 2000);
       }
 
       if (seasonStop) break;
 
-      setBanner(`✅ Saved ${epTitle}. Pausing before next episode…`);
-
-      // Brief jittered pause — keeps request cadence human-paced and
-      // reduces any chance of triggering Crunchyroll's rate limiter.
-      await sleep(2000 + Math.random() * 2000);
-      if (seasonStop) break;
-
-      setBanner(`✅ Saved ${epTitle}. Looking for next episode…`);
+      setBanner(`🔎 Looking for next episode…`);
 
       const target = findNextEpisodeTarget();
       if (!target) {
-        setBanner(`🏁 Done — no next-episode link found. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        setBanner(`🏁 Done — no next-episode link found. ${summary()}`);
         break;
       }
 
@@ -1205,13 +1299,13 @@
 
       const navigated = await waitForUrlChange(oldUrl, 15000);
       if (!navigated) {
-        setBanner(`🏁 Navigation didn't happen — stopping. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        setBanner(`🏁 Navigation didn't happen — stopping. ${summary()}`);
         break;
       }
 
-      // Stop if we've already downloaded this URL — means the playlist cycled back.
+      // Stop if we've already visited this URL this run — playlist cycled back.
       if (visitedUrls.has(location.href)) {
-        setBanner(`🏁 Reached end of season. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        setBanner(`🏁 Reached end of season. ${summary()}`);
         break;
       }
       visitedUrls.add(location.href);
@@ -1223,10 +1317,10 @@
       // Try autoplay if needed
       await tryAutoplay();
 
-      setBanner(`⏳ Waiting for episode ${seasonCount + 1} subtitles to load…`);
+      setBanner(`⏳ Waiting for the next episode's subtitles to load…`);
       const newEntries = await waitForVttEntries(45000);
       if (!newEntries || newEntries.length === 0) {
-        setBanner(`🏁 Timed out waiting for subtitles on the next episode. Downloaded ${seasonCount} episode${seasonCount !== 1 ? "s" : ""}.`);
+        setBanner(`🏁 Timed out waiting for subtitles on the next episode. ${summary()}`);
         break;
       }
 
