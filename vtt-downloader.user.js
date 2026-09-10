@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.23.0
+// @version      1.24.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -800,6 +800,8 @@
     .vdp-banner { padding: 7px 14px !important; background: #1e1b4b !important; border-bottom: 1px solid #4338ca !important; font-size: 11px !important; color: #c7d2fe !important; display: none !important; }
     .vdp-banner.visible { display: block !important; }
     .vdp-banner b { color: #fff !important; }
+    .vdp-banner.success { background: #052e16 !important; border-bottom-color: #16a34a !important; color: #bbf7d0 !important; font-weight: 600 !important; }
+    .vdp-banner.success b { color: #fff !important; }
   `);
 
   // ── UI ─────────────────────────────────────────────────────────────────────
@@ -1077,12 +1079,13 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  function setBanner(html) {
+  function setBanner(html, type) {
     const b = document.getElementById("vtt-dl-banner");
     if (!b) return;
-    if (!html) { b.classList.remove("visible"); b.innerHTML = ""; return; }
+    if (!html) { b.classList.remove("visible", "success"); b.innerHTML = ""; return; }
     b.innerHTML = html;
     b.classList.add("visible");
+    b.classList.toggle("success", type === "success");
   }
 
   // Pick the "best" VTT entry: prefer English [CC], then English, then any HLS, then first.
@@ -1313,6 +1316,7 @@
       // Make sure this episode's metadata is loaded before we identify it.
       await waitForMetadata(15000);
       const meta = getEpisodeMetadata();
+      const curEp = meta && typeof meta.episode === "number" ? meta.episode : null;
       const epTitle = meta
         ? `${meta.series} S${String(meta.season).padStart(2, "0")}E${String(meta.episode).padStart(2, "0")}`
         : `Episode ${seasonCount + skipped + 1}`;
@@ -1350,28 +1354,41 @@
       const oldUrl = location.href;
       const navigated = await goToNextEpisode(oldUrl);
       if (!navigated) {
-        setBanner(`🏁 Couldn't reach the next episode automatically — click it once to continue. ${summary()}`);
+        // No next-episode control found — almost always because that was the
+        // last episode of the season.
+        setBanner(`✅ Season complete — that was the last episode. ${summary()}`, "success");
         break;
       }
 
       // Stop if we've already visited this URL this run — playlist cycled back.
       if (visitedUrls.has(location.href)) {
-        setBanner(`🏁 Reached end of season. ${summary()}`);
+        setBanner(`✅ Season complete — reached the end. ${summary()}`, "success");
         break;
       }
       visitedUrls.add(location.href);
 
-      // Give the page a moment to clear state
+      // Give the page a moment to settle, then re-read metadata for the page we
+      // actually landed on.
       await sleep(2500);
       if (seasonStop) break;
-
-      // Try autoplay if needed
       await tryAutoplay();
+
+      // Directional guard: on the last episode Crunchyroll's "next" control (or
+      // its up-next card) often points BACKWARD to an earlier episode. If we
+      // didn't move forward, we're done — stop before waiting on a duplicate.
+      metaCache = null; metaCacheUrl = null;
+      await waitForMetadata(15000);
+      const newMeta = getEpisodeMetadata();
+      const newEp = newMeta && typeof newMeta.episode === "number" ? newMeta.episode : null;
+      if (curEp != null && newEp != null && newEp <= curEp) {
+        setBanner(`✅ Season complete — that was the last episode. ${summary()}`, "success");
+        break;
+      }
 
       setBanner(`⏳ Waiting for the next episode's subtitles to load…`);
       const newEntries = await waitForVttEntries(45000);
       if (!newEntries || newEntries.length === 0) {
-        setBanner(`🏁 Timed out waiting for subtitles on the next episode. ${summary()}`);
+        setBanner(`⚠️ Stopped — no subtitles loaded on the next episode. ${summary()}`);
         break;
       }
 
@@ -1381,10 +1398,9 @@
     seasonActive = false;
     seasonStop = false;
     updateUI();
-    setTimeout(() => {
-      const banner = document.getElementById("vtt-dl-banner");
-      if (banner && !seasonActive) setTimeout(() => setBanner(""), 8000);
-    }, 100);
+    // Leave the final banner up long enough to be noticed, but don't wipe a new
+    // run if the user starts one.
+    setTimeout(() => { if (!seasonActive) setBanner(""); }, 20000);
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
