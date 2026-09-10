@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.25.0
+// @version      1.26.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1186,26 +1186,53 @@
     try { el.click(); } catch {}
   }
 
-  // Advance to the next episode using SPA (soft) navigation so this loop keeps
-  // running.  Tries several targets, clicking each realistically and retrying,
-  // rather than clicking once and giving up on the first timeout.
-  async function goToNextEpisode(oldUrl) {
-    const candidates = [];
-    const seen = new Set();
-    const add = (el) => { if (el && !seen.has(el)) { seen.add(el); candidates.push(el); } };
-    add(findNextEpisodeTarget());        // player "Next Episode" control (if present)
-    add(findNextEpisodeLinkByNumber());  // episode-list link for ep N+1 (usually present)
-
-    if (candidates.length === 0) return false;
-
-    for (const el of candidates) {
-      for (let attempt = 0; attempt < 2 && !seasonStop; attempt++) {
-        dispatchRealClick(el);
-        if (await waitForUrlChange(oldUrl, attempt === 0 ? 12000 : 6000)) return true;
+  // Advance to the next episode and get its subtitles ready. If any step stalls
+  // for ~8s — the click not navigating, or the page navigating but its subtitles
+  // never loading (e.g. a Crunchyroll network error) — fire the back/forward
+  // nudge and try again, up to a few rounds, so a stuck load recovers on its own
+  // instead of ending the run. Uses soft SPA nav only (never a full reload).
+  // Returns { entries } on success, "end" at the last episode / a cycle-back,
+  // or null if it couldn't recover.
+  async function reachNextEpisode(oldUrl, curEp, visitedUrls) {
+    const MAX_ROUNDS = 5;
+    for (let round = 0; round < MAX_ROUNDS && !seasonStop; round++) {
+      // (Re)trigger navigation while we're still on the episode we just finished.
+      if (location.href === oldUrl) {
+        const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
+        if (!el && round === 0) return "end"; // no next control at all → last episode
+        if (el) dispatchRealClick(el);
+        await waitForUrlChange(oldUrl, 8000);
       }
-      if (seasonStop) return false;
+      if (seasonStop) return null;
+
+      // Did we land on a new page?
+      if (location.href !== oldUrl) {
+        // Cycled back to an already-downloaded episode → end of season.
+        if (visitedUrls.has(location.href)) return "end";
+
+        // Confirm we moved FORWARD — Crunchyroll's up-next card can point back.
+        metaCache = null; metaCacheUrl = null;
+        const m = await waitForMetadata(8000);
+        const ep = m && typeof m.episode === "number" ? m.episode : null;
+        if (curEp != null && ep != null && ep <= curEp) return "end";
+
+        await tryAutoplay();
+        const entries = await waitForVttEntries(8000);
+        if (entries && entries.length) {
+          visitedUrls.add(location.href);
+          return { entries };
+        }
+        // URL changed but subtitles never loaded — fall through to a nudge.
+      }
+
+      // Stalled this round → nudge (back → forward) and try again.
+      if (round < MAX_ROUNDS - 1 && !seasonStop) {
+        setBanner(`↩︎ Next episode stuck — nudging player (back → forward)… (try ${round + 1})`);
+        await historyNudge();
+        await tryAutoplay();
+      }
     }
-    return false;
+    return null;
   }
 
   // Re-trigger Crunchyroll's SPA loader by stepping back then forward — the
@@ -1371,65 +1398,23 @@
 
       if (seasonStop) break;
 
-      setBanner(`🔎 Looking for next episode…`);
+      setBanner(`🔎 Loading next episode…`);
 
+      // Reach the next episode, nudging (back → forward) whenever a step stalls
+      // for ~8s, so a stuck or network-errored load recovers without help.
       const oldUrl = location.href;
-      const navigated = await goToNextEpisode(oldUrl);
-      if (!navigated) {
-        // No next-episode control found — almost always because that was the
-        // last episode of the season.
+      const result = await reachNextEpisode(oldUrl, curEp, visitedUrls);
+      if (seasonStop) break;
+      if (result === "end") {
         setBanner(`✅ Season complete — that was the last episode. ${summary()}`, "success");
         break;
       }
-
-      // Stop if we've already visited this URL this run — playlist cycled back.
-      if (visitedUrls.has(location.href)) {
-        setBanner(`✅ Season complete — reached the end. ${summary()}`, "success");
-        break;
-      }
-      visitedUrls.add(location.href);
-
-      // Give the page a moment to settle, then re-read metadata for the page we
-      // actually landed on.
-      await sleep(2500);
-      if (seasonStop) break;
-      await tryAutoplay();
-
-      // Directional guard: on the last episode Crunchyroll's "next" control (or
-      // its up-next card) often points BACKWARD to an earlier episode. If we
-      // didn't move forward, we're done — stop before waiting on a duplicate.
-      metaCache = null; metaCacheUrl = null;
-      await waitForMetadata(15000);
-      const newMeta = getEpisodeMetadata();
-      const newEp = newMeta && typeof newMeta.episode === "number" ? newMeta.episode : null;
-      if (curEp != null && newEp != null && newEp <= curEp) {
-        setBanner(`✅ Season complete — that was the last episode. ${summary()}`, "success");
+      if (!result || !result.entries) {
+        setBanner(`⚠️ Stopped — couldn't load the next episode after several tries. ${summary()}`);
         break;
       }
 
-      setBanner(`⏳ Waiting for the next episode's subtitles to load…`);
-      let newEntries = await waitForVttEntries(9000);
-
-      // Nudge before giving up: if nothing loaded after a few seconds, step
-      // back+forward to re-trigger the player, then wait the rest of the window.
-      // Retry the nudge once more if still nothing, so a single stuck load
-      // doesn't end the whole run.
-      for (let nudge = 0; nudge < 2 && !newEntries && !seasonStop; nudge++) {
-        setBanner(`↩︎ Next episode slow to load — nudging player (back → forward)…`);
-        await historyNudge();
-        if (seasonStop) break;
-        await tryAutoplay();
-        setBanner(`⏳ Waiting for the next episode's subtitles to load…`);
-        newEntries = await waitForVttEntries(18000);
-      }
-
-      if (seasonStop) break;
-      if (!newEntries || newEntries.length === 0) {
-        setBanner(`⚠️ Stopped — no subtitles loaded on the next episode. ${summary()}`);
-        break;
-      }
-
-      next = pickPreferredEntry(newEntries, preferLabel);
+      next = pickPreferredEntry(result.entries, preferLabel);
     }
 
     seasonActive = false;
