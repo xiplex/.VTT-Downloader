@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.34.0
+// @version      1.35.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1157,21 +1157,16 @@
     return null;
   }
 
-  // Find the episode-list link for episode (current + 1).  This works even when
-  // the player's "Next Episode" overlay isn't showing — which is common here,
-  // since we only download subtitles and never play the video to the end.
-  function findNextEpisodeLinkByNumber() {
-    const meta = getEpisodeMetadata();
-    if (!meta || !meta.episode) return null;
-    const nextNum = meta.episode + 1;
-    // Match "E12", "S1E12", "S1 E12", "Episode 12", "EP 12" — but not
-    // "E120"/"E121". The char before E must not be a LETTER (a season digit is
-    // fine, e.g. the "1" in "S1E12"), and the char after the number must not be
-    // another digit.
+  // Find the episode-list link for a SPECIFIC episode number. Clicking a numbered
+  // link is deterministic — we can't accidentally overshoot to N+2 — which is why
+  // it's preferred over the generic "Next" button for advancing.
+  // Matches "E12", "S1E12", "S1 E12", "Episode 12", "EP 12" — not "E120"/"E121".
+  function findEpisodeLinkByNumber(n) {
+    if (!n || n < 1) return null;
     const rxs = [
-      new RegExp(`(^|[^A-Za-z])E\\s*0*${nextNum}([^0-9]|$)`, "i"),
-      new RegExp(`\\bEpisode\\s+0*${nextNum}([^0-9]|$)`, "i"),
-      new RegExp(`\\bEp\\.?\\s*0*${nextNum}([^0-9]|$)`, "i"),
+      new RegExp(`(^|[^A-Za-z])E\\s*0*${n}([^0-9]|$)`, "i"),
+      new RegExp(`\\bEpisode\\s+0*${n}([^0-9]|$)`, "i"),
+      new RegExp(`\\bEp\\.?\\s*0*${n}([^0-9]|$)`, "i"),
     ];
     const here = location.href;
     for (const a of document.querySelectorAll('a[href*="/watch/"]')) {
@@ -1194,35 +1189,66 @@
     try { el.click(); } catch {}
   }
 
-  // Advance to the next episode and get its subtitles ready — and just keep
-  // going episode after episode until there are no more. No episode-number
-  // guessing: we simply click "next" and stop only when we can't move to a NEW
-  // episode (either nothing to click, or it loops back to one we already did).
-  // If a step stalls (~8s) — the click not navigating, or the page navigating
-  // but its subtitles never loading (e.g. a Crunchyroll network error) — fire
-  // the back/forward nudge and try again. Soft SPA nav only (never a reload).
+  // Expand Crunchyroll's episode list so every numbered episode link is present.
+  function expandEpisodeList() {
+    try {
+      const btn = document.querySelector('[data-t="see-more-episodes-btn"], button.see-all-button');
+      if (btn && btn.offsetParent !== null) btn.click();
+    } catch {}
+  }
+
+  // Pause the player so it can't auto-advance to the next episode while we're
+  // busy downloading — which would make us skip an episode.
+  function pauseVideo() {
+    try {
+      const v = document.querySelector("video");
+      if (v && !v.paused && typeof v.pause === "function") v.pause();
+    } catch {}
+  }
+
+  // Crunchyroll resumes playback where you left off. If that's near the end, the
+  // episode can finish (and auto-advance to the next one) during our download —
+  // skipping an episode. Seek back to the start so the end is ~24 min away.
+  function seekToStart() {
+    try {
+      const v = document.querySelector("video");
+      if (v && typeof v.currentTime === "number" && v.currentTime > 30) v.currentTime = 0;
+    } catch {}
+  }
+
+  // Advance to the next episode and get its subtitles ready. To avoid ever
+  // skipping, we click the SPECIFIC "episode N+1" link (deterministic) rather
+  // than the generic Next button, falling back to the Next button only when the
+  // numbered link can't be found (e.g. metadata unavailable). Stops when there's
+  // no further episode or it loops back to one already done.
   // Returns { entries } on success, "end" when there's no further episode, or
-  // null if it couldn't recover after several tries.
-  async function reachNextEpisode(oldUrl, visitedUrls) {
-    // ── Step 1: navigate to a NEW url. Only the *click not navigating* is
-    // treated as "stuck" and worth a nudge — a slow-loading page is not. ──
+  // null if it couldn't recover.
+  async function reachNextEpisode(oldUrl, currentEp, visitedUrls) {
+    const target = (typeof currentEp === "number" && currentEp >= 1) ? currentEp + 1 : null;
+
+    // ── Step 1: navigate to a NEW url (only a click that fails to navigate is
+    // "stuck" and worth a nudge — a slow-loading page is not). ──
     for (let round = 0; round < 5 && !seasonStop && location.href === oldUrl; round++) {
-      await tryAutoplay(); // playing surfaces the player's next-episode control
-      // The player's "Next Episode" button is the source of truth; the
-      // forward-by-number link is a backup. Neither can be a "previous".
-      const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
+      pauseVideo(); // don't let it auto-advance out from under us
+
+      // Prefer the specific numbered episode link so we can't overshoot to N+2.
+      let el = null;
+      if (target != null) {
+        el = findEpisodeLinkByNumber(target);
+        if (!el) { expandEpisodeList(); await sleep(500); el = findEpisodeLinkByNumber(target); }
+      }
+      if (!el) el = findNextEpisodeTarget(); // fallback: player's Next button
+
       if (el) {
         dispatchRealClick(el);
         await waitForUrlChange(oldUrl, 8000);
       } else if (round >= 1) {
-        // Gave the page a moment (a nudge) and there is still no Next Episode
-        // control — this really is the last episode. Stop cleanly.
+        // No numbered next link and no Next control after a nudge → last episode.
         return "end";
       }
       if (location.href === oldUrl && round < 4 && !seasonStop) {
         setBanner(`↩︎ Next episode didn't load — nudging player (back → forward)… (try ${round + 1})`);
         await historyNudge();
-        await tryAutoplay();
       }
     }
     if (seasonStop) return null;
@@ -1231,10 +1257,10 @@
     // ── Step 2: we're on a new page. Stop if it's one we've already done. ──
     if (visitedUrls.has(location.href)) return "end";
 
-    // ── Step 3: wait PATIENTLY for its subtitles (no nudge — the page is
-    // loading; a nudge would only disrupt it). Nudge once only as a last
-    // resort if nothing ever shows up. ──
+    // ── Step 3: wait PATIENTLY for its subtitles, then pause so the player
+    // can't auto-advance during the download. Nudge once only as a last resort. ──
     await tryAutoplay();
+    seekToStart(); // keep the end far away so it can't auto-advance mid-wait
     let entries = await waitForVttEntries(22000);
     if ((!entries || !entries.length) && !seasonStop) {
       setBanner(`↩︎ Subtitles slow to load — nudging player (back → forward)…`);
@@ -1242,6 +1268,7 @@
       await tryAutoplay();
       entries = await waitForVttEntries(22000);
     }
+    pauseVideo();
     if (entries && entries.length) {
       visitedUrls.add(location.href);
       return { entries };
@@ -1391,9 +1418,12 @@
     const visitedUrls = new Set([location.href]);
 
     // Ensure the player is running so Crunchyroll renders JSON-LD and updates
-    // document.title before we try to read episode metadata for episode 1.
+    // document.title before we try to read episode metadata for episode 1, then
+    // pause so it can't auto-advance while we download.
     await tryAutoplay();
     await sleep(1500);
+    seekToStart();
+    pauseVideo();
 
     let next = initial;
     let skipped = 0;
@@ -1440,10 +1470,11 @@
 
       setBanner(`🔎 Loading next episode…`);
 
-      // Reach the next episode, nudging (back → forward) whenever a step stalls
-      // for ~8s, so a stuck or network-errored load recovers without help.
+      // Reach the next episode by clicking the specific "episode N+1" link so we
+      // can't overshoot; nudge only if a click fails to navigate.
       const oldUrl = location.href;
-      const result = await reachNextEpisode(oldUrl, visitedUrls);
+      const curEp = meta && typeof meta.episode === "number" ? meta.episode : null;
+      const result = await reachNextEpisode(oldUrl, curEp, visitedUrls);
       if (seasonStop) break;
       if (result === "end") {
         setBanner(`✅ Season complete — no more episodes. ${summary()}`, "success");
