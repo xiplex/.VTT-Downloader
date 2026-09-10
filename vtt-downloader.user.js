@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.31.0
+// @version      1.32.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1190,16 +1190,18 @@
     return null;
   }
 
-  // Dispatch a full, realistic click sequence — some SPA controls ignore a bare
-  // element.click() (they listen for pointer/mouse events), so send those too.
+  // Send the pointer/mouse gesture some SPA controls expect, then activate the
+  // element EXACTLY ONCE with a single native click(). (Previously this also
+  // dispatched a synthetic "click" event on top of the native click(), which
+  // could double-activate a button — advancing two episodes and skipping one.)
   function dispatchRealClick(el) {
     if (!el) return;
     try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
     const opts = { bubbles: true, cancelable: true, view: window };
-    for (const type of ["pointerover", "pointerenter", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    for (const type of ["pointerover", "pointerenter", "pointerdown", "mousedown", "pointerup", "mouseup"]) {
       try { el.dispatchEvent(new MouseEvent(type, opts)); } catch {}
     }
-    try { el.click(); } catch {}
+    try { el.click(); } catch {} // the one and only activation
   }
 
   // Advance to the next episode and get its subtitles ready — and just keep
