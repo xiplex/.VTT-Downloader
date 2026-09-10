@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.30.0
+// @version      1.31.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1120,31 +1120,44 @@
     return /\bprev\b|previous|\bback\b/.test(s);
   }
 
-  // Try a list of selectors to find Crunchyroll's "next episode" control, while
-  // explicitly rejecting any "previous episode" control.
+  // Find Crunchyroll's "next episode" control, never a "previous" one.
+  // (Confirmed markup: <button data-testid="next-episode-button" aria-label=
+  // "Next Episode"> in the player, plus an <a>"Next Episode" card link.)
   function findNextEpisodeTarget() {
-    const selectors = [
-      '[data-testid="skip-to-next-episode-button"]',
-      '[data-t="next-episode-button"]',
+    // Most reliable: the player's dedicated Next Episode button. Return it even
+    // when it looks "hidden" (offsetParent null while the controls overlay is
+    // collapsed) — it's still the correct control to click.
+    const strong = [
+      'button[data-testid="next-episode-button"]',
       '[data-testid="next-episode-button"]',
-      '[data-testid="next-episode"]',
-      'button[aria-label*="Next Episode" i]',
-      'a[aria-label*="Next Episode" i]',
-      'button[aria-label*="Up Next" i]',
-      'a[aria-label*="Up Next" i]',
-      'button[aria-label*="Next" i][aria-label*="episode" i]',
-      'a[aria-label*="Next" i][aria-label*="episode" i]',
+      'button[aria-label="Next Episode" i]',
+      'a[aria-label^="Next Episode" i]',
+      '[data-testid="skip-to-next-episode-button"]',
+    ];
+    for (const sel of strong) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!looksLikePrevious(el)) return el;
+      }
+    }
+    // The "Next Episode" card link — its visible text is exactly "Next Episode"
+    // (the sibling "Previous Episode" card is excluded by the exact match).
+    for (const a of document.querySelectorAll('a[href*="/watch/"]')) {
+      if ((a.textContent || "").trim().toLowerCase() === "next episode" && !looksLikePrevious(a)) return a;
+    }
+    // Broader fallbacks (require visibility, still excluding previous).
+    const selectors = [
+      '[data-t="next-episode-button"]',
       '[class*="next-episode" i] a',
       '[class*="next-episode" i] button',
-      '[class*="NextEpisode" i] a',
-      '[class*="NextEpisode" i] button',
-      '.up-next-section a',
+      'button[aria-label*="Next" i][aria-label*="episode" i]',
+      'a[aria-label*="Next" i][aria-label*="episode" i]',
       '[data-t="up-next"] a',
+      '.up-next-section a',
     ];
     for (const sel of selectors) {
       for (const el of document.querySelectorAll(sel)) {
         if (looksLikePrevious(el)) continue;
-        if (el && (el.offsetParent !== null || el.tagName === "A")) return el;
+        if (el.offsetParent !== null || el.tagName === "A") return el;
       }
     }
     return null;
@@ -1204,12 +1217,16 @@
       // (Re)trigger navigation while we're still on the episode we just finished.
       if (location.href === oldUrl) {
         await tryAutoplay(); // playing surfaces the player's next-episode control
-        // Prefer the forward-by-number link (explicitly episode N+1) over the
-        // player control, so we never accidentally hit "previous episode".
-        const el = findNextEpisodeLinkByNumber() || findNextEpisodeTarget();
+        // The player's "Next Episode" button is the source of truth; the
+        // forward-by-number link is a backup. Neither can be a "previous".
+        const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
         if (el) {
           dispatchRealClick(el);
           await waitForUrlChange(oldUrl, 8000);
+        } else if (round >= 1) {
+          // We gave the page a moment (a nudge) and there is still no Next
+          // Episode control — so this really is the last episode. Stop cleanly.
+          return "end";
         }
       }
       if (seasonStop) return null;
