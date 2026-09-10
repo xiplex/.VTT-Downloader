@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.33.0
+// @version      1.34.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -63,19 +63,13 @@
     } catch {}
   }
 
-  // Stable per-episode identity: prefer series + season + episode from metadata,
-  // falling back to the episode's URL path (unique per Crunchyroll episode) when
-  // metadata isn't available yet.
-  function episodeKey(entry) {
-    const meta = getEpisodeMetadata();
-    if (meta) {
-      const s  = sanitizeName(meta.series).toLowerCase();
-      const se = String(meta.season  || 1).padStart(2, "0");
-      const ep = String(meta.episode || 1).padStart(2, "0");
-      if (s) return `ep:${s}|s${se}e${ep}`;
-    }
-    try { return "url:" + new URL((entry && entry.url) || location.href, location.href).pathname.toLowerCase(); }
-    catch { return "url:" + ((entry && entry.url) || location.href); }
+  // Stable per-episode identity = the episode PAGE url path (e.g.
+  // "/watch/g7pu323xq/eternity"). It's unique per episode and updates instantly
+  // on navigation, unlike metadata tags which lag a moment after an SPA jump and
+  // could make a fresh episode look already-downloaded (causing skips).
+  function episodeKey() {
+    try { return "url:" + new URL(location.href).pathname.toLowerCase().replace(/\/+$/, ""); }
+    catch { return "url:" + location.href; }
   }
 
   function isDownloaded(entry) {
@@ -1190,18 +1184,14 @@
     return null;
   }
 
-  // Send the pointer/mouse gesture some SPA controls expect, then activate the
-  // element EXACTLY ONCE with a single native click(). (Previously this also
-  // dispatched a synthetic "click" event on top of the native click(), which
-  // could double-activate a button — advancing two episodes and skipping one.)
+  // Activate an element with a SINGLE native click(). Crunchyroll's Next button
+  // and episode links are ordinary buttons/anchors that respond to click(), and
+  // firing extra pointer/mouse events on top risked a second activation that
+  // advanced two episodes (skipping one). Keep it to exactly one click.
   function dispatchRealClick(el) {
     if (!el) return;
     try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
-    const opts = { bubbles: true, cancelable: true, view: window };
-    for (const type of ["pointerover", "pointerenter", "pointerdown", "mousedown", "pointerup", "mouseup"]) {
-      try { el.dispatchEvent(new MouseEvent(type, opts)); } catch {}
-    }
-    try { el.click(); } catch {} // the one and only activation
+    try { el.click(); } catch {}
   }
 
   // Advance to the next episode and get its subtitles ready — and just keep
