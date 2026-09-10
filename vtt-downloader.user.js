@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.27.0
+// @version      1.28.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1157,9 +1157,12 @@
     const meta = getEpisodeMetadata();
     if (!meta || !meta.episode) return null;
     const nextNum = meta.episode + 1;
-    // Match "E12", "Episode 12", "EP 12" — but not "E120"/"E121" (digit boundary).
+    // Match "E12", "S1E12", "S1 E12", "Episode 12", "EP 12" — but not
+    // "E120"/"E121". The char before E must not be a LETTER (a season digit is
+    // fine, e.g. the "1" in "S1E12"), and the char after the number must not be
+    // another digit.
     const rxs = [
-      new RegExp(`(^|[^0-9])E0*${nextNum}([^0-9]|$)`, "i"),
+      new RegExp(`(^|[^A-Za-z])E\\s*0*${nextNum}([^0-9]|$)`, "i"),
       new RegExp(`\\bEpisode\\s+0*${nextNum}([^0-9]|$)`, "i"),
       new RegExp(`\\bEp\\.?\\s*0*${nextNum}([^0-9]|$)`, "i"),
     ];
@@ -1198,10 +1201,18 @@
     for (let round = 0; round < MAX_ROUNDS && !seasonStop; round++) {
       // (Re)trigger navigation while we're still on the episode we just finished.
       if (location.href === oldUrl) {
+        await tryAutoplay(); // playing surfaces the player's next-episode control
         const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
-        if (!el && round === 0) return "end"; // no next control at all → last episode
-        if (el) dispatchRealClick(el);
-        await waitForUrlChange(oldUrl, 8000);
+        if (el) {
+          dispatchRealClick(el);
+          await waitForUrlChange(oldUrl, 8000);
+        } else if (round >= 1 && curEp != null) {
+          // We've already nudged at least once (the episode list had a chance to
+          // render) and metadata is reliable, yet there's still no next-episode
+          // link — so this really is the last episode. Don't conclude "end" on
+          // the very first miss, which caused mid-season false stops.
+          return "end";
+        }
       }
       if (seasonStop) return null;
 
