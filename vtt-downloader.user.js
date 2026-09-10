@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.32.0
+// @version      1.33.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1214,45 +1214,47 @@
   // Returns { entries } on success, "end" when there's no further episode, or
   // null if it couldn't recover after several tries.
   async function reachNextEpisode(oldUrl, visitedUrls) {
-    const MAX_ROUNDS = 6;
-    for (let round = 0; round < MAX_ROUNDS && !seasonStop; round++) {
-      // (Re)trigger navigation while we're still on the episode we just finished.
-      if (location.href === oldUrl) {
-        await tryAutoplay(); // playing surfaces the player's next-episode control
-        // The player's "Next Episode" button is the source of truth; the
-        // forward-by-number link is a backup. Neither can be a "previous".
-        const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
-        if (el) {
-          dispatchRealClick(el);
-          await waitForUrlChange(oldUrl, 8000);
-        } else if (round >= 1) {
-          // We gave the page a moment (a nudge) and there is still no Next
-          // Episode control — so this really is the last episode. Stop cleanly.
-          return "end";
-        }
+    // ── Step 1: navigate to a NEW url. Only the *click not navigating* is
+    // treated as "stuck" and worth a nudge — a slow-loading page is not. ──
+    for (let round = 0; round < 5 && !seasonStop && location.href === oldUrl; round++) {
+      await tryAutoplay(); // playing surfaces the player's next-episode control
+      // The player's "Next Episode" button is the source of truth; the
+      // forward-by-number link is a backup. Neither can be a "previous".
+      const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
+      if (el) {
+        dispatchRealClick(el);
+        await waitForUrlChange(oldUrl, 8000);
+      } else if (round >= 1) {
+        // Gave the page a moment (a nudge) and there is still no Next Episode
+        // control — this really is the last episode. Stop cleanly.
+        return "end";
       }
-      if (seasonStop) return null;
-
-      // Did we land on a new page?
-      if (location.href !== oldUrl) {
-        // Looped back to an episode we've already completed this run → done.
-        if (visitedUrls.has(location.href)) return "end";
-
-        await tryAutoplay();
-        const entries = await waitForVttEntries(8000);
-        if (entries && entries.length) {
-          visitedUrls.add(location.href); // commit only once its subtitles are ready
-          return { entries };
-        }
-        // URL changed but subtitles never loaded — fall through to a nudge.
-      }
-
-      // Stalled this round → nudge (back → forward) and try again.
-      if (round < MAX_ROUNDS - 1 && !seasonStop) {
-        setBanner(`↩︎ Next episode not ready — nudging player (back → forward)… (try ${round + 1})`);
+      if (location.href === oldUrl && round < 4 && !seasonStop) {
+        setBanner(`↩︎ Next episode didn't load — nudging player (back → forward)… (try ${round + 1})`);
         await historyNudge();
         await tryAutoplay();
       }
+    }
+    if (seasonStop) return null;
+    if (location.href === oldUrl) return null; // never managed to navigate
+
+    // ── Step 2: we're on a new page. Stop if it's one we've already done. ──
+    if (visitedUrls.has(location.href)) return "end";
+
+    // ── Step 3: wait PATIENTLY for its subtitles (no nudge — the page is
+    // loading; a nudge would only disrupt it). Nudge once only as a last
+    // resort if nothing ever shows up. ──
+    await tryAutoplay();
+    let entries = await waitForVttEntries(22000);
+    if ((!entries || !entries.length) && !seasonStop) {
+      setBanner(`↩︎ Subtitles slow to load — nudging player (back → forward)…`);
+      await historyNudge();
+      await tryAutoplay();
+      entries = await waitForVttEntries(22000);
+    }
+    if (entries && entries.length) {
+      visitedUrls.add(location.href);
+      return { entries };
     }
     return null;
   }
@@ -1320,6 +1322,31 @@
     return getEpisodeMetadata();
   }
 
+  // Signature of an episode's metadata — used to tell one episode's tags apart
+  // from another's (for filename freshness after an SPA navigation).
+  function metaSig(m) {
+    return m ? `${m.series}|${m.season}|${m.episode}|${m.title}` : null;
+  }
+
+  // Wait for metadata that belongs to the CURRENT episode, not the previous one.
+  // Right after an SPA navigation the page can still expose the prior episode's
+  // og:title / JSON-LD for a moment; building a filename from that names the file
+  // after the wrong episode. Poll (re-parsing each time) until the signature
+  // differs from `prevSig`, or time out.
+  async function waitForFreshMetadata(prevSig, timeoutMs = 12000) {
+    const start = Date.now();
+    let m = getEpisodeMetadata();
+    while (Date.now() - start < timeoutMs) {
+      if (seasonStop) break;
+      metaCache = null; metaCacheUrl = null; // force a fresh parse of the live DOM
+      m = getEpisodeMetadata();
+      const sig = metaSig(m);
+      if (sig && sig !== prevSig) return m;
+      await sleep(500);
+    }
+    return m;
+  }
+
   async function tryAutoplay() {
     // If autoplay is blocked, click the play button so the player loads subtitles.
     const playSelectors = [
@@ -1380,13 +1407,15 @@
 
     let next = initial;
     let skipped = 0;
+    let prevSig = null; // metadata signature of the previous episode (freshness)
     const summary = () =>
       `Downloaded ${seasonCount}${skipped ? `, skipped ${skipped} already-saved` : ""}.`;
 
     while (next && !seasonStop) {
-      // Make sure this episode's metadata is loaded before we identify it.
-      await waitForMetadata(15000);
-      const meta = getEpisodeMetadata();
+      // Wait for metadata that belongs to THIS episode (not the previous one's
+      // stale tags) before we name/identify it, so filenames match.
+      const meta = await waitForFreshMetadata(prevSig, 12000);
+      prevSig = metaSig(meta);
       const epTitle = meta
         ? `${meta.series} S${String(meta.season).padStart(2, "0")}E${String(meta.episode).padStart(2, "0")}`
         : `Episode ${seasonCount + skipped + 1}`;
