@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.28.0
+// @version      1.29.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1189,15 +1189,17 @@
     try { el.click(); } catch {}
   }
 
-  // Advance to the next episode and get its subtitles ready. If any step stalls
-  // for ~8s — the click not navigating, or the page navigating but its subtitles
-  // never loading (e.g. a Crunchyroll network error) — fire the back/forward
-  // nudge and try again, up to a few rounds, so a stuck load recovers on its own
-  // instead of ending the run. Uses soft SPA nav only (never a full reload).
-  // Returns { entries } on success, "end" at the last episode / a cycle-back,
-  // or null if it couldn't recover.
-  async function reachNextEpisode(oldUrl, curEp, visitedUrls) {
-    const MAX_ROUNDS = 5;
+  // Advance to the next episode and get its subtitles ready — and just keep
+  // going episode after episode until there are no more. No episode-number
+  // guessing: we simply click "next" and stop only when we can't move to a NEW
+  // episode (either nothing to click, or it loops back to one we already did).
+  // If a step stalls (~8s) — the click not navigating, or the page navigating
+  // but its subtitles never loading (e.g. a Crunchyroll network error) — fire
+  // the back/forward nudge and try again. Soft SPA nav only (never a reload).
+  // Returns { entries } on success, "end" when there's no further episode, or
+  // null if it couldn't recover after several tries.
+  async function reachNextEpisode(oldUrl, visitedUrls) {
+    const MAX_ROUNDS = 6;
     for (let round = 0; round < MAX_ROUNDS && !seasonStop; round++) {
       // (Re)trigger navigation while we're still on the episode we just finished.
       if (location.href === oldUrl) {
@@ -1206,34 +1208,19 @@
         if (el) {
           dispatchRealClick(el);
           await waitForUrlChange(oldUrl, 8000);
-        } else if (round >= 1 && curEp != null) {
-          // We've already nudged at least once (the episode list had a chance to
-          // render) and metadata is reliable, yet there's still no next-episode
-          // link — so this really is the last episode. Don't conclude "end" on
-          // the very first miss, which caused mid-season false stops.
-          return "end";
         }
       }
       if (seasonStop) return null;
 
       // Did we land on a new page?
       if (location.href !== oldUrl) {
-        // Cycled back to an already-downloaded episode → end of season.
+        // Looped back to an episode we've already completed this run → done.
         if (visitedUrls.has(location.href)) return "end";
-
-        // Confirm we moved FORWARD — Crunchyroll's up-next card can point back.
-        // Wait for tags that actually differ from the episode we just did, so a
-        // mid-transition stale read doesn't look like a backward jump.
-        const m = await waitForForwardMetadata(curEp, 12000);
-        const ep = m && typeof m.episode === "number" ? m.episode : null;
-        // Only "end" on a strictly BACKWARD jump (lower number). Equal means the
-        // tags were still stale, not a real backward move — keep going.
-        if (curEp != null && ep != null && ep < curEp) return "end";
 
         await tryAutoplay();
         const entries = await waitForVttEntries(8000);
         if (entries && entries.length) {
-          visitedUrls.add(location.href);
+          visitedUrls.add(location.href); // commit only once its subtitles are ready
           return { entries };
         }
         // URL changed but subtitles never loaded — fall through to a nudge.
@@ -1241,7 +1228,7 @@
 
       // Stalled this round → nudge (back → forward) and try again.
       if (round < MAX_ROUNDS - 1 && !seasonStop) {
-        setBanner(`↩︎ Next episode stuck — nudging player (back → forward)… (try ${round + 1})`);
+        setBanner(`↩︎ Next episode not ready — nudging player (back → forward)… (try ${round + 1})`);
         await historyNudge();
         await tryAutoplay();
       }
@@ -1312,25 +1299,6 @@
     return getEpisodeMetadata();
   }
 
-  // Like waitForMetadata, but keeps re-reading until the reported episode number
-  // differs from `prevEp`. Right after an SPA navigation the page can still be
-  // showing the PREVIOUS episode's tags for a moment; reading them too early
-  // makes the "did we move forward?" check misfire (and skip the last episode).
-  async function waitForForwardMetadata(prevEp, timeoutMs = 12000) {
-    const start = Date.now();
-    let last = null;
-    while (Date.now() - start < timeoutMs) {
-      if (seasonStop) return last;
-      metaCache = null; metaCacheUrl = null; // force a fresh parse of the live DOM
-      const m = getEpisodeMetadata();
-      last = m || last;
-      const ep = m && typeof m.episode === "number" ? m.episode : null;
-      if (ep != null && (prevEp == null || ep !== prevEp)) return m;
-      await sleep(500);
-    }
-    return last;
-  }
-
   async function tryAutoplay() {
     // If autoplay is blocked, click the play button so the player loads subtitles.
     const playSelectors = [
@@ -1398,7 +1366,6 @@
       // Make sure this episode's metadata is loaded before we identify it.
       await waitForMetadata(15000);
       const meta = getEpisodeMetadata();
-      const curEp = meta && typeof meta.episode === "number" ? meta.episode : null;
       const epTitle = meta
         ? `${meta.series} S${String(meta.season).padStart(2, "0")}E${String(meta.episode).padStart(2, "0")}`
         : `Episode ${seasonCount + skipped + 1}`;
@@ -1436,14 +1403,14 @@
       // Reach the next episode, nudging (back → forward) whenever a step stalls
       // for ~8s, so a stuck or network-errored load recovers without help.
       const oldUrl = location.href;
-      const result = await reachNextEpisode(oldUrl, curEp, visitedUrls);
+      const result = await reachNextEpisode(oldUrl, visitedUrls);
       if (seasonStop) break;
       if (result === "end") {
-        setBanner(`✅ Season complete — that was the last episode. ${summary()}`, "success");
+        setBanner(`✅ Season complete — no more episodes. ${summary()}`, "success");
         break;
       }
       if (!result || !result.entries) {
-        setBanner(`⚠️ Stopped — couldn't load the next episode after several tries. ${summary()}`);
+        setBanner(`⚠️ Stopped — couldn't reach the next episode after several tries. ${summary()}`);
         break;
       }
 
