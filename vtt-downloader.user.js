@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.29.0
+// @version      1.30.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1106,7 +1106,22 @@
     );
   }
 
-  // Try a list of selectors / strategies to find Crunchyroll's "next episode" trigger.
+  // Does this element look like a "previous episode" control? We must never click
+  // one — it navigates backward, which the loop then mistakes for end-of-season.
+  function looksLikePrevious(el) {
+    if (!el) return false;
+    const s = [
+      el.getAttribute && el.getAttribute("aria-label"),
+      el.getAttribute && el.getAttribute("data-testid"),
+      el.getAttribute && el.getAttribute("data-t"),
+      el.getAttribute && el.getAttribute("title"),
+      el.className && el.className.toString(),
+    ].filter(Boolean).join(" ").toLowerCase();
+    return /\bprev\b|previous|\bback\b/.test(s);
+  }
+
+  // Try a list of selectors to find Crunchyroll's "next episode" control, while
+  // explicitly rejecting any "previous episode" control.
   function findNextEpisodeTarget() {
     const selectors = [
       '[data-testid="skip-to-next-episode-button"]',
@@ -1115,6 +1130,8 @@
       '[data-testid="next-episode"]',
       'button[aria-label*="Next Episode" i]',
       'a[aria-label*="Next Episode" i]',
+      'button[aria-label*="Up Next" i]',
+      'a[aria-label*="Up Next" i]',
       'button[aria-label*="Next" i][aria-label*="episode" i]',
       'a[aria-label*="Next" i][aria-label*="episode" i]',
       '[class*="next-episode" i] a',
@@ -1125,28 +1142,11 @@
       '[data-t="up-next"] a',
     ];
     for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el && (el.offsetParent !== null || el.tagName === "A")) return el;
-    }
-
-    // Fallback: find the currently-playing episode card and grab the next sibling's link.
-    const currentSelectors = [
-      '[data-t="current-episode"]',
-      '[aria-current="true"]',
-      '[aria-current="page"]',
-      '.current-episode',
-      '.is-current',
-    ];
-    for (const sel of currentSelectors) {
-      const cur = document.querySelector(sel);
-      if (!cur) continue;
-      const sib = cur.nextElementSibling;
-      if (sib) {
-        const link = sib.matches("a") ? sib : sib.querySelector("a[href*='/watch/']");
-        if (link) return link;
+      for (const el of document.querySelectorAll(sel)) {
+        if (looksLikePrevious(el)) continue;
+        if (el && (el.offsetParent !== null || el.tagName === "A")) return el;
       }
     }
-
     return null;
   }
 
@@ -1204,7 +1204,9 @@
       // (Re)trigger navigation while we're still on the episode we just finished.
       if (location.href === oldUrl) {
         await tryAutoplay(); // playing surfaces the player's next-episode control
-        const el = findNextEpisodeTarget() || findNextEpisodeLinkByNumber();
+        // Prefer the forward-by-number link (explicitly episode N+1) over the
+        // player control, so we never accidentally hit "previous episode".
+        const el = findNextEpisodeLinkByNumber() || findNextEpisodeTarget();
         if (el) {
           dispatchRealClick(el);
           await waitForUrlChange(oldUrl, 8000);
