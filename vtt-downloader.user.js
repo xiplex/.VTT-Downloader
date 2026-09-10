@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.26.0
+// @version      1.27.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1211,10 +1211,13 @@
         if (visitedUrls.has(location.href)) return "end";
 
         // Confirm we moved FORWARD — Crunchyroll's up-next card can point back.
-        metaCache = null; metaCacheUrl = null;
-        const m = await waitForMetadata(8000);
+        // Wait for tags that actually differ from the episode we just did, so a
+        // mid-transition stale read doesn't look like a backward jump.
+        const m = await waitForForwardMetadata(curEp, 12000);
         const ep = m && typeof m.episode === "number" ? m.episode : null;
-        if (curEp != null && ep != null && ep <= curEp) return "end";
+        // Only "end" on a strictly BACKWARD jump (lower number). Equal means the
+        // tags were still stale, not a real backward move — keep going.
+        if (curEp != null && ep != null && ep < curEp) return "end";
 
         await tryAutoplay();
         const entries = await waitForVttEntries(8000);
@@ -1296,6 +1299,25 @@
       await sleep(400);
     }
     return getEpisodeMetadata();
+  }
+
+  // Like waitForMetadata, but keeps re-reading until the reported episode number
+  // differs from `prevEp`. Right after an SPA navigation the page can still be
+  // showing the PREVIOUS episode's tags for a moment; reading them too early
+  // makes the "did we move forward?" check misfire (and skip the last episode).
+  async function waitForForwardMetadata(prevEp, timeoutMs = 12000) {
+    const start = Date.now();
+    let last = null;
+    while (Date.now() - start < timeoutMs) {
+      if (seasonStop) return last;
+      metaCache = null; metaCacheUrl = null; // force a fresh parse of the live DOM
+      const m = getEpisodeMetadata();
+      last = m || last;
+      const ep = m && typeof m.episode === "number" ? m.episode : null;
+      if (ep != null && (prevEp == null || ep !== prevEp)) return m;
+      await sleep(500);
+    }
+    return last;
   }
 
   async function tryAutoplay() {
