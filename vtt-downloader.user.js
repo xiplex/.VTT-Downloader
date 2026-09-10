@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.24.0
+// @version      1.25.0
 // @description  Detects WebVTT subtitle files on any page and shows a floating download panel
 // @author       xiplex
 // @match        *://*/*
@@ -1208,6 +1208,28 @@
     return false;
   }
 
+  // Re-trigger Crunchyroll's SPA loader by stepping back then forward — the
+  // automated version of the manual "browser back, then forward" trick that
+  // unsticks a half-loaded next episode. Returns to the same URL when done.
+  async function historyNudge() {
+    if (history.length <= 1) return; // nothing to step back to
+    const target = location.href;
+    try {
+      history.back();
+      await sleep(1600);
+      if (seasonStop) return;
+      history.forward();
+      await sleep(1600);
+      // If forward didn't restore the episode, click a same-page link back to it
+      // (soft nav — never a full reload, which would kill this loop).
+      if (location.href !== target && !seasonStop) {
+        const link = [...document.querySelectorAll('a[href]')]
+          .find((a) => { try { return new URL(a.getAttribute("href"), location.href).href === target; } catch { return false; } });
+        if (link) { dispatchRealClick(link); await sleep(1600); }
+      }
+    } catch {}
+  }
+
   async function waitForUrlChange(oldUrl, timeoutMs) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -1386,7 +1408,22 @@
       }
 
       setBanner(`⏳ Waiting for the next episode's subtitles to load…`);
-      const newEntries = await waitForVttEntries(45000);
+      let newEntries = await waitForVttEntries(9000);
+
+      // Nudge before giving up: if nothing loaded after a few seconds, step
+      // back+forward to re-trigger the player, then wait the rest of the window.
+      // Retry the nudge once more if still nothing, so a single stuck load
+      // doesn't end the whole run.
+      for (let nudge = 0; nudge < 2 && !newEntries && !seasonStop; nudge++) {
+        setBanner(`↩︎ Next episode slow to load — nudging player (back → forward)…`);
+        await historyNudge();
+        if (seasonStop) break;
+        await tryAutoplay();
+        setBanner(`⏳ Waiting for the next episode's subtitles to load…`);
+        newEntries = await waitForVttEntries(18000);
+      }
+
+      if (seasonStop) break;
       if (!newEntries || newEntries.length === 0) {
         setBanner(`⚠️ Stopped — no subtitles loaded on the next episode. ${summary()}`);
         break;
