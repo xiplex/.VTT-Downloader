@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.36.0
-// @description  Detect WebVTT subtitles on any page; on Crunchyroll, name files by episode and auto-download a whole season
+// @version      1.37.0
+// @description  Detect WebVTT subtitles on any page; on Crunchyroll, name files by episode (via its content API) and auto-download a whole season
 // @author       xiplex
 // @match        *://*/*
 // @grant        GM_download
@@ -348,6 +348,10 @@
     let url = "";
     try { url = typeof input === "string" ? input : (input && input.url) || ""; } catch {}
     if (url && isVttUrl(url)) reportVtt(url, "network");
+    // Piggyback on Crunchyroll's own authorized requests to capture its bearer
+    // token (see "Crunchyroll API"), so we can call the content API ourselves.
+    try { captureAuth(init && init.headers); } catch {}
+    try { if (input && typeof input === "object" && input.headers) captureAuth(input.headers); } catch {}
 
     const promise = origFetch(input, init);
 
@@ -384,6 +388,13 @@
       pendingUrl = url;
       if (isVttUrl(url)) reportVtt(url, "network");
       return origOpen.call(xhr, method, url, ...rest);
+    };
+
+    // Capture the bearer token from the app's authorized XHRs (see "Crunchyroll API").
+    const origSetHeader = xhr.setRequestHeader;
+    xhr.setRequestHeader = function (name, value) {
+      try { if (/^authorization$/i.test(name)) captureAuth([[name, value]]); } catch {}
+      return origSetHeader.call(xhr, name, value);
     };
 
     xhr.addEventListener("load", function () {
@@ -433,6 +444,115 @@
   // (see saveTextAsVtt). We deliberately don't patch revokeObjectURL: the page
   // revokes its blobs normally, and we retain the text in blobVttStore anyway.
   const origRevokeObjectURL = pageWin.URL.revokeObjectURL.bind(pageWin.URL);
+
+  // ── Crunchyroll API ─────────────────────────────────────────────────────────
+  // Instead of scraping the rendered page (fragile) or clicking through the SPA
+  // player (fragile), talk to the same content API the web app uses. We never
+  // handle a login: we PIGGYBACK on the bearer token the app already sends with
+  // its own requests (captured in the fetch/XHR patches above) and reuse it for
+  // same-origin API calls. Everything here is best-effort — if the token or an
+  // endpoint is unavailable, callers fall back to the page-scraping path. Verbose
+  // logging (`[VTT CR-API]`) makes a real Crunchyroll test session diagnosable.
+  const CR = {
+    token: null,            // "Bearer …" captured from the app's own requests
+    metaByPath: new Map(),  // episode path → { series, season, episode, title }
+  };
+  const crLog = (...a) => { try { console.log("[VTT CR-API]", ...a); } catch {} };
+  const isCrunchyroll = /(^|\.)crunchyroll\.com$/i.test(location.hostname);
+
+  function captureAuth(headers) {
+    if (!headers) return;
+    let auth = null;
+    try {
+      if (typeof headers.get === "function") auth = headers.get("authorization");
+      else if (Array.isArray(headers)) { for (const [k, v] of headers) if (/^authorization$/i.test(k)) auth = v; }
+      else if (typeof headers === "object") { for (const k of Object.keys(headers)) if (/^authorization$/i.test(k)) auth = headers[k]; }
+    } catch {}
+    if (auth && /^bearer\s+\S/i.test(auth) && auth !== CR.token) {
+      const first = !CR.token;
+      CR.token = auth;
+      crLog("captured bearer token", first ? "(first)" : "(refreshed)");
+      // The first time we see a token, prime metadata for the current episode so
+      // the panel shows a proper filename without the user starting a season run.
+      if (first) refreshCrMeta();
+    }
+  }
+
+  function crEpisodeIdFromUrl(u) {
+    try { const m = new URL(u || location.href, location.href).pathname.match(/\/watch\/([^/?#]+)/i); return m ? m[1] : null; }
+    catch { return null; }
+  }
+
+  function crPathKey(u) {
+    try { return new URL(u || location.href, location.href).pathname.toLowerCase().replace(/\/+$/, ""); }
+    catch { return (u || location.href).toLowerCase(); }
+  }
+
+  async function crApi(path) {
+    if (!CR.token) throw new Error("no-token");
+    const url = path.startsWith("http") ? path : "https://www.crunchyroll.com" + path;
+    const resp = await fetch(url, {
+      headers: { authorization: CR.token },
+      credentials: "include",
+    });
+    if (!resp.ok) throw new Error("http-" + resp.status);
+    return resp.json();
+  }
+
+  // Normalize one API episode record into our metadata shape.
+  function crToMeta(rec) {
+    const em = rec.episode_metadata || rec;
+    const series  = (em.series_title || "").trim();
+    const season  = parseInt(em.season_number, 10) || 1;
+    const episode = parseInt(em.episode_number != null ? em.episode_number : em.sequence_number, 10) || 1;
+    const title   = (rec.title || em.title || "").trim();
+    if (!series) return null;
+    return { series, season, episode, title: title || `Episode ${String(episode).padStart(2, "0")}` };
+  }
+
+  // Fetch clean metadata for one episode id via /content/v2/cms/objects/{id}.
+  async function crGetEpisode(id) {
+    const j = await crApi(`/content/v2/cms/objects/${id}?ratings=false&locale=en-US`);
+    const rec = j && j.data && j.data[0];
+    if (!rec) return null;
+    const meta = crToMeta(rec);
+    return meta && { ...meta, id, seasonId: (rec.episode_metadata || {}).season_id };
+  }
+
+  // Fetch the ORDERED episode list for a season → the deterministic season queue.
+  async function crSeasonEpisodes(seasonId) {
+    const j = await crApi(`/content/v2/cms/seasons/${seasonId}/episodes?locale=en-US`);
+    const rows = (j && j.data) || [];
+    return rows.map((e) => {
+      const meta = crToMeta(e) || {};
+      // Capture the episode number even for rows that lack series_title (meta null),
+      // so ordering/labels survive; buildCrSeasonPlan fills series/season from `cur`.
+      const episode = meta.episode || parseInt(e.episode_number != null ? e.episode_number : e.sequence_number, 10) || null;
+      return {
+        id: e.id,
+        slug: e.slug_title || "",
+        url: `https://www.crunchyroll.com/watch/${e.id}/${e.slug_title || ""}`,
+        series: meta.series || "", season: meta.season || null, episode, title: meta.title || "",
+      };
+    }).filter((e) => e.id);
+  }
+
+  // Populate CR.metaByPath for the CURRENT episode so buildFilename can use it.
+  // Safe to call anytime; no-ops without a token or outside a /watch/ page.
+  async function refreshCrMeta() {
+    const id = crEpisodeIdFromUrl();
+    if (!isCrunchyroll || !id || !CR.token) return null;
+    try {
+      const ep = await crGetEpisode(id);
+      if (ep) {
+        CR.metaByPath.set(crPathKey(), { series: ep.series, season: ep.season, episode: ep.episode, title: ep.title });
+        crLog("metadata", `${ep.series} S${ep.season}E${ep.episode} — ${ep.title}`);
+        if (isTopFrame) updateUI();
+        return ep;
+      }
+    } catch (e) { crLog("refreshCrMeta failed:", e.message || e); }
+    return null;
+  }
 
   // ── DOM scanning ───────────────────────────────────────────────────────────
 
@@ -555,6 +675,12 @@
     const differsFromSeries = (title, series) =>
       !!title && title.trim().toLowerCase() !== series.trim().toLowerCase();
     const remember = (meta) => { metaCache = meta; metaCacheUrl = here; return meta; };
+
+    // ── Source 0 (authoritative): Crunchyroll API metadata ────────────────────
+    // Populated by refreshCrMeta() from the content API. When present it's the
+    // ground truth (never scraped), so it beats every page-derived source below.
+    const apiMeta = CR.metaByPath.get(crPathKey(here));
+    if (apiMeta && apiMeta.series) return remember({ ...apiMeta });
 
     // ── Source 1 (structured): JSON-LD TVEpisode ──────────────────────────────
     // Gives series / season / episode directly. When its own title field is
@@ -1413,6 +1539,149 @@
     await sleep(1500);
   }
 
+  // Find the episode-list anchor that links to a SPECIFIC episode id. Clicking it
+  // is a soft (SPA) navigation to a KNOWN-correct URL — deterministic, unlike the
+  // old "which button is Next?" heuristics.
+  function findWatchLinkById(id) {
+    if (!id) return null;
+    for (const a of document.querySelectorAll(`a[href*="/watch/${id}"]`)) {
+      if (!looksLikePrevious(a)) return a;
+    }
+    return null;
+  }
+
+  // Navigate to a specific episode from the API plan. Prefer its exact id-link;
+  // expand the list if needed; fall back to a numbered link. Confirms we actually
+  // landed on the intended episode. Returns false if it couldn't get there
+  // (the caller stops cleanly rather than guessing).
+  async function navigateToEpisode(ep) {
+    const oldUrl = location.href;
+    pauseVideo();
+    let link = findWatchLinkById(ep.id);
+    if (!link) { expandEpisodeList(); await sleep(600); link = findWatchLinkById(ep.id); }
+    if (!link) link = findEpisodeLinkByNumber(ep.episode);
+    if (!link) { crLog("no in-page link for episode", ep.episode, ep.id); return false; }
+    crLog("navigating →", `S${ep.season}E${ep.episode}`, ep.id);
+    dispatchRealClick(link);
+    let changed = await waitForUrlChange(oldUrl, 8000);
+    if (!changed && !seasonStop) { await historyNudge(); changed = location.href !== oldUrl; }
+    if (crEpisodeIdFromUrl(location.href) === ep.id) return true;
+    crLog("navigation landed on unexpected page:", location.href);
+    return crPathKey(location.href) === crPathKey(ep.url);
+  }
+
+  // Build the deterministic season queue from the API: the ordered episode list
+  // plus where the current episode sits in it. Returns null (→ fall back to the
+  // page-scraping loop) if the token or any endpoint is unavailable.
+  async function buildCrSeasonPlan() {
+    if (!isCrunchyroll) return null;
+    for (let i = 0; i < 16 && !CR.token && !seasonStop; i++) await sleep(500); // wait for a token
+    if (!CR.token) { crLog("no bearer token captured — cannot use API path"); return null; }
+    const id = crEpisodeIdFromUrl();
+    if (!id) return null;
+    try {
+      const cur = await crGetEpisode(id);
+      if (!cur || !cur.seasonId) { crLog("no season id for", id); return null; }
+      const episodes = await crSeasonEpisodes(cur.seasonId);
+      if (!episodes.length) { crLog("empty season episode list"); return null; }
+      // Fill any gaps from the authoritative current episode so every filename is complete.
+      for (const e of episodes) {
+        if (!e.series) e.series = cur.series;
+        if (!e.season) e.season = cur.season;
+        if (!e.episode) e.episode = 1;
+        if (!e.title) e.title = `Episode ${String(e.episode).padStart(2, "0")}`;
+      }
+      let index = episodes.findIndex((e) => e.id === id);
+      if (index < 0) index = episodes.findIndex((e) => e.episode === cur.episode);
+      if (index < 0) index = 0;
+      for (const e of episodes) {
+        CR.metaByPath.set(crPathKey(e.url), { series: e.series, season: e.season, episode: e.episode, title: e.title });
+      }
+      // Always label the starting page from the episode we actually fetched.
+      CR.metaByPath.set(crPathKey(), { series: cur.series, season: cur.season, episode: cur.episode, title: cur.title });
+      crLog(`season plan: ${episodes.length} episodes, starting at #${index + 1} (${cur.series} S${cur.season})`);
+      return { episodes, index };
+    } catch (e) { crLog("buildCrSeasonPlan failed:", e.message || e); return null; }
+  }
+
+  // Run the season using the API plan: for each episode in order, open its known
+  // page, grab the subtitles, download with the API's clean filename. No "next
+  // episode" guessing, no stale-metadata races, and end-of-season is simply the
+  // end of the list.
+  async function runSeasonViaApi(plan, preferLabel) {
+    const eps = plan.episodes;
+    const total = eps.length - plan.index;
+    let skipped = 0;
+    const pad = (n) => String(n).padStart(2, "0");
+    const summary = () => `Downloaded ${seasonCount}${skipped ? `, skipped ${skipped}` : ""}.`;
+
+    for (let i = plan.index; i < eps.length && !seasonStop; i++) {
+      const ep = eps[i];
+      const epTitle = `${ep.series} S${pad(ep.season)}E${pad(ep.episode)}`;
+
+      if (i !== plan.index) {
+        setBanner(`🔎 Opening <b>${epTitle}</b>…`);
+        if (!(await navigateToEpisode(ep))) {
+          setBanner(`⚠️ Couldn't open ${epTitle}. ${summary()}`);
+          break;
+        }
+        await sleep(1200); // let the SPA settle + the URL-change handler clear old state
+        // Drop the previous episode's detections so we never grab its subtitle.
+        foundVtts.clear(); blobVttStore.clear(); hlsSegmentUrls.clear();
+        metaCache = null; metaCacheUrl = null;
+        if (isTopFrame) updateUI();
+      }
+      if (seasonStop) break;
+
+      // The API name is authoritative for THIS page — key it to the live path.
+      CR.metaByPath.set(crPathKey(location.href), { series: ep.series, season: ep.season, episode: ep.episode, title: ep.title });
+
+      await tryAutoplay();
+      seekToStart();
+      let entries = await waitForVttEntries(22000);
+      if ((!entries || !entries.length) && !seasonStop) {
+        setBanner(`↩︎ Subtitles slow for ${epTitle} — nudging…`);
+        await historyNudge(); await tryAutoplay();
+        entries = await waitForVttEntries(22000);
+      }
+      pauseVideo();
+      if (seasonStop) break;
+      if (!entries || !entries.length) {
+        crLog("no subtitles found for", epTitle);
+        setBanner(`⚠️ No subtitles found for ${epTitle} — skipping.`);
+        skipped++; await sleep(800);
+        continue;
+      }
+
+      const entry = pickPreferredEntry(entries, preferLabel);
+      if (isDownloaded(entry)) {
+        skipped++;
+        setBanner(`⏭ Already downloaded <b>${epTitle}</b> — skipping.`);
+        await sleep(700);
+        continue;
+      }
+
+      setBanner(`⏳ Downloading <b>${epTitle}</b> (${i - plan.index + 1}/${total})…`);
+      try {
+        await downloadAndWait(entry);
+        seasonCount++;
+      } catch (e) {
+        const msg = e.message || String(e);
+        if (msg.includes("429") || /rate limit/i.test(msg)) {
+          setBanner(`🚫 Rate limited after ${seasonCount} download${seasonCount !== 1 ? "s" : ""}. Try again later.`);
+          break;
+        }
+        setBanner(`⚠️ ${msg}`);
+        await sleep(2000);
+      }
+      if (seasonStop) break;
+      setBanner(`✅ Saved ${epTitle}. Pausing before next…`);
+      await sleep(2000 + Math.random() * 2000);
+    }
+
+    if (!seasonStop) setBanner(`✅ Season complete. ${summary()}`, "success");
+  }
+
   async function toggleSeasonDownload() {
     if (seasonActive) {
       seasonStop = true;
@@ -1443,6 +1712,22 @@
     await sleep(1500);
     seekToStart();
     pauseVideo();
+
+    // Preferred path: drive the season from Crunchyroll's content API (ordered
+    // episode list + authoritative metadata). Falls back to the page-scraping
+    // loop below when the API isn't reachable (no token, non-Crunchyroll, etc.).
+    const plan = await buildCrSeasonPlan();
+    if (plan && !seasonStop) {
+      try { await runSeasonViaApi(plan, preferLabel); }
+      catch (e) { crLog("runSeasonViaApi crashed:", e.message || e); setBanner(`⚠️ ${e.message || e}`); }
+      finally {
+        seasonActive = false; seasonStop = false; updateUI();
+        setTimeout(() => { if (!seasonActive) setBanner(""); }, 20000);
+      }
+      return;
+    }
+    if (seasonStop) { seasonActive = false; updateUI(); return; }
+    crLog("using page-navigation fallback");
 
     let next = initial;
     let skipped = 0;
@@ -1545,6 +1830,7 @@
           metaCache = null;
           metaCacheUrl = null;
           setTimeout(scanDOM, 600);
+          refreshCrMeta(); // fetch clean API metadata for the new episode (no-op without a token)
           updateUI();
         }
       }, 1000);

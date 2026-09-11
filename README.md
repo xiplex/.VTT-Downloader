@@ -94,12 +94,14 @@ bottom-right corner. Click it to open the download panel.
 On a Crunchyroll watch page the userscript adds:
 
 - **English [CC] only.** Non-English and non-caption tracks are filtered out of the panel.
-- **Episode-aware filenames.** Downloads are named `Series_S01E01_Title - English [CC].vtt` using the page's episode metadata instead of an opaque server filename.
+- **Episode-aware filenames.** Downloads are named `Series_S01E01_Title - English [CC].vtt`. The series/season/episode/title come from Crunchyroll's own content API when available (authoritative), falling back to reading the page.
 - **HLS merging.** When captions are served as HLS segments, they're stitched back into a single `.vtt`.
-- **Season ▶.** Auto-downloads every episode in the season: grab subtitles, advance to the next episode, repeat. It remembers what it has already downloaded (across reloads) and skips duplicates. Click **Stop ⏹** to end early; the **history ✕** link forgets the record so you can re-download.
+- **Season ▶.** Auto-downloads every episode in the season. When it can reach the content API it walks the real, ordered episode list (accurate names, no "next episode" guessing, reliable end-of-season); otherwise it falls back to clicking through the player. It remembers what it has already downloaded (across reloads) and skips duplicates. Click **Stop ⏹** to end early; the **history ✕** link forgets the record so you can re-download.
 
-> The Crunchyroll features work by reading the page and driving its player, so
-> they can break when Crunchyroll changes its site. See
+> The API path piggybacks on the token Crunchyroll's own page already uses — it
+> never handles your login. If it can't (no token, site change), it degrades to
+> reading the page and driving the player, which is more fragile. Open the
+> browser console and look for `[VTT CR-API]` lines to see which path ran. See
 > [`ARCHITECTURE.md`](ARCHITECTURE.md) if you're maintaining this.
 
 ---

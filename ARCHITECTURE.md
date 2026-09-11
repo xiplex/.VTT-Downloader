@@ -47,11 +47,20 @@ on purpose. If a show is named wrong, the fix is almost always to make a
 
 ### 2. Season navigation (the fragile half)
 
-The season loop advances by *driving the player UI*: find the "Next Episode"
-button or the numbered episode link, click it, wait for the SPA to load, nudge
-history if it stalls. That is why it keeps breaking on layout changes, and why
-the loop is full of hard-won invariants. **Do not revert these without reading
-the commit that added them:**
+As of v1.37 there are **two** season paths (`toggleSeasonDownload`):
+
+1. **API path (preferred, `runSeasonViaApi`)** — see "Crunchyroll API" below.
+   Uses the content API for the ordered episode list + clean metadata, so
+   filenames are authoritative, "next episode" is a known URL (no guessing), and
+   end-of-season is just the end of the list. This is the durable fix; it kills
+   the naming, stale-metadata, and false-"last-episode" bugs.
+2. **Page-scraping fallback (the original loop)** — runs only when the API path
+   can't start (no bearer token captured, not on Crunchyroll, or an endpoint
+   fails). It advances by *driving the player UI*: find the "Next Episode" button
+   or numbered link, click it, wait for the SPA, nudge history if it stalls.
+
+The fallback is fragile and full of hard-won invariants. **Do not revert these
+without reading the commit that added them:**
 
 - **Single native `click()` only** (`dispatchRealClick`). Firing extra
   pointer/mouse events double-activated the control and skipped an episode.
@@ -67,33 +76,54 @@ the commit that added them:**
 - **Wait for *fresh* metadata** before naming a file (`waitForFreshMetadata`).
   The prior episode's tags linger briefly after navigation.
 
-## The real fix for the navigation churn (recommended, not yet done)
+## Crunchyroll API (the real fix — implemented v1.37)
 
-UI-driving will always be fragile. The durable fix is to stop scraping the
-rendered page and use Crunchyroll's own content API, which the web app already
-calls:
+UI-driving will always be fragile, so the metadata and season navigation now
+prefer Crunchyroll's own content API. See the "Crunchyroll API" section in
+`vtt-downloader.user.js`.
 
-- `GET /content/v2/cms/seasons/{season_id}/episodes` returns the **ordered**
-  episode list with clean `title`, `episode_number`, `season_number`, and
-  `series_title`, plus each episode's watch URL/id.
+**How the token is obtained.** We never handle a login. The fetch/XHR patches
+already wrap the page's own network calls, so `captureAuth()` skims the
+`Authorization: Bearer …` header off Crunchyroll's *own* authorized requests and
+stashes it (`CR.token`). We then reuse it for same-origin API calls
+(`crApi()`). No client secret, no `/token` grant, nothing to keep in sync with
+Crunchyroll's auth flow.
 
-With that list, the season loop becomes "for each episode in order, navigate to
-its known URL and grab the subtitles" — no button-clicking, no history nudging,
-no stall detection, and metadata comes straight from JSON (killing most of
-`getEpisodeMetadata` too).
+**Endpoints used** (same-origin, Bearer only — no CMS signing needed):
 
-**Why it isn't done yet / the tradeoffs:**
+- `GET /content/v2/cms/objects/{episodeId}?locale=en-US` → the current episode's
+  `episode_metadata` (`series_title`, `season_number`, `episode_number`,
+  `season_id`) and clean `title`.
+- `GET /content/v2/cms/seasons/{seasonId}/episodes?locale=en-US` → the **ordered**
+  episode list (each with `id`, `slug_title`, numbers, titles) → the season queue.
 
-- The API needs a bearer token that the page holds (typically reachable via the
-  `/token` endpoint or an in-page store). Lifting it reliably is its own
-  maintenance surface, and it can change.
-- It couldn't be validated from the development environment (Crunchyroll is
-  auth-gated and JS-rendered), so shipping it blind would risk breaking the one
-  navigation path that currently works.
+**How it's wired in:**
 
-Recommended approach when picking this up: implement the API path *behind* the
-existing UI-driving loop as a fallback, verify it live on a couple of seasons,
-then make it primary and delete the heuristics it replaces.
+- `refreshCrMeta()` caches the current episode's metadata in `CR.metaByPath`
+  (keyed by URL path). `getEpisodeMetadata()` checks that map first (Source 0,
+  authoritative), so filenames are correct even when the page hasn't rendered.
+- `buildCrSeasonPlan()` builds the ordered queue + current index;
+  `runSeasonViaApi()` walks it, navigating to each episode's **known** URL via
+  its exact id-link (`findWatchLinkById` → deterministic, no overshoot) and
+  reusing the proven in-page subtitle detection + download path.
+
+**Deliberate limits / where it can still fail (candidates for the next pass):**
+
+- Navigation is still an in-page (SPA) click on the episode's own link. If that
+  link isn't in the DOM (and expanding the list doesn't reveal it), the run
+  stops cleanly rather than guessing. If testing shows this happens often, the
+  planned next step is **full-page navigation with a persisted resume queue**
+  (store the plan in `GM_setValue`, `location.assign` each episode, resume on
+  load) — maximally reliable because every page is fully loaded.
+- Subtitles are still detected in-page (needs playback), not fetched from the
+  API play endpoint. The play endpoint (`cr-play-service…/v1/{id}/…/play`) would
+  remove playback entirely but is cross-origin, may open a stream "session" that
+  must be released, and can serve non-VTT formats — deferred until the above is
+  proven.
+- **Untested against live Crunchyroll** from the dev environment (its network is
+  blocked there). Verbose `[VTT CR-API]` console logging exists so a real test
+  session is diagnosable. If the API path no-ops, the log says why and the
+  page-scraping fallback takes over.
 
 ## Testing without Crunchyroll
 
