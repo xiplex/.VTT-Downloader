@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VTT Downloader
 // @namespace    https://github.com/xiplex/.vtt-downloader
-// @version      1.35.0
-// @description  Detects WebVTT subtitle files on any page and shows a floating download panel
+// @version      1.36.0
+// @description  Detect WebVTT subtitles on any page; on Crunchyroll, name files by episode and auto-download a whole season
 // @author       xiplex
 // @match        *://*/*
 // @grant        GM_download
@@ -14,6 +14,25 @@
 // @connect      *
 // @run-at       document-start
 // ==/UserScript==
+
+// ─────────────────────────────────────────────────────────────────────────────
+// This script has two layers:
+//   1. A SITE-AGNOSTIC detector — patches fetch/XHR/blob and scans the DOM to
+//      find WebVTT subtitle files on any page (see "Network interception" and
+//      "DOM scanning").
+//   2. A CRUNCHYROLL layer built on top — English-[CC] filtering, HLS segment
+//      merging, "Series_S01E01_Title" filename building, and a season
+//      auto-downloader that walks episode → episode.
+//
+// The Crunchyroll layer works by reading the page (JSON-LD, the DOM) and driving
+// its player UI, which makes it inherently fragile. Before "fixing" the metadata
+// or navigation heuristics, read ARCHITECTURE.md — it documents the invariants
+// that must NOT be reverted and why, so the same bugs stop recurring.
+//
+// Section map: Download history · URL helpers · English-[CC] filter · VTT store ·
+// HLS parsing · Network interception · Episode metadata · Filename building ·
+// DOM scanning · Styles · UI · Download logic · Season auto-download · Bootstrap.
+// ─────────────────────────────────────────────────────────────────────────────
 
 (function () {
   "use strict";
@@ -410,10 +429,10 @@
     return blobUrl;
   };
 
+  // Keep a reference to the original revoke so we can clean up our OWN blob URLs
+  // (see saveTextAsVtt). We deliberately don't patch revokeObjectURL: the page
+  // revokes its blobs normally, and we retain the text in blobVttStore anyway.
   const origRevokeObjectURL = pageWin.URL.revokeObjectURL.bind(pageWin.URL);
-  // Don't actually overwrite — let the page revoke normally; we keep the text
-  // in blobVttStore independent of the URL's lifecycle.
-  void origRevokeObjectURL;
 
   // ── DOM scanning ───────────────────────────────────────────────────────────
 
@@ -467,12 +486,15 @@
       .trim();
   }
 
-  // Parse an og:title or document.title string into episode metadata.
-  // Covers the main formats Crunchyroll uses:
+  // FALLBACK ONLY (see getEpisodeMetadata source 4). Parse a human-readable
+  // og:title / document.title string into episode metadata. This is fragile by
+  // nature — Crunchyroll uses several title layouts and adds new ones — so it runs
+  // only after the structured sources fail. Covers the formats seen so far:
   //   "Watch Series Season 2 Episode 5 – Title | Crunchyroll"
   //   "Watch Series Episode 5 – Title | Crunchyroll"
   //   "Watch Series – E5 – Title | Crunchyroll"   (short format)
   //   "Watch Series - S1E5 – Title | Crunchyroll"
+  //   "DAN DA DAN Season 2 (English Dub) | E23 - Title"   (pipe format)
   function parseTitleString(raw) {
     const base = raw.replace(/^Watch\s+/i, "").trim();
 
@@ -516,125 +538,122 @@
     return null;
   }
 
+  // Extract episode metadata for the current page, most reliable source first.
+  //
+  // DESIGN PRINCIPLE — prefer STRUCTURED data over parsing human-readable text.
+  // Crunchyroll embeds the answer as JSON-LD (machine-readable series/season/
+  // episode/title); the URL slug is likewise machine-generated. Those are stable.
+  // Parsing og:title / document.title strings is fragile — every new show's title
+  // format has historically broken it — so those parsers are the LAST resort here,
+  // not the first. Do not reorder them earlier without reading ARCHITECTURE.md;
+  // that ordering is the fix for the recurring filename bugs, not an accident.
   function getEpisodeMetadata() {
     if (metaCache && metaCacheUrl !== location.href) { metaCache = null; metaCacheUrl = null; }
     if (metaCache) return metaCache;
 
     const here = location.href;
-    const notSameAsSeries = (title, series) =>
+    const differsFromSeries = (title, series) =>
       !!title && title.trim().toLowerCase() !== series.trim().toLowerCase();
+    const remember = (meta) => { metaCache = meta; metaCacheUrl = here; return meta; };
 
-    // ── Source 1: og:title / twitter:title / document.title ───────────────────
+    // ── Source 1 (structured): JSON-LD TVEpisode ──────────────────────────────
+    // Gives series / season / episode directly. When its own title field is
+    // usable we're done; otherwise keep the numbers as `ldBase` for sources 2–4.
+    let ldBase = null; // { series, season, episode } when the title was unusable
+    for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const root = JSON.parse(el.textContent);
+        for (const node of [].concat(root?.["@graph"] || root)) {
+          if (!node || !/TVEpisode|Episode/i.test(node["@type"] || "")) continue;
+          const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
+          if (!series) continue;
+          const ldUrl = (node.url || "").trim();
+          if (ldUrl && !pathsMatch(ldUrl, here)) continue; // belongs to another episode
+          const episode = parseInt(node.episodeNumber, 10) || 1;
+          const season  = parseInt(node.partOfSeason?.seasonNumber, 10) || 1;
+          const title   = cleanEpisodeTitle((node.name || "").trim(), series);
+          if (differsFromSeries(title, series)) return remember({ series, season, episode, title });
+          if (!ldBase) ldBase = { series, season, episode }; // title bad, numbers still good
+        }
+      } catch {}
+    }
+
+    // ── Source 1b (structured): JSON-LD VideoObject ───────────────────────────
+    // A second JSON-LD block whose "name" is the clean episode title (no series
+    // prefix, no ep#) — rescues cases where TVEpisode.name duplicated the series.
+    if (ldBase) {
+      for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+          const root = JSON.parse(el.textContent);
+          if (root["@type"] === "VideoObject" && root.name) {
+            const title = root.name.trim();
+            if (differsFromSeries(title, ldBase.series)) return remember({ ...ldBase, title });
+          }
+        } catch {}
+      }
+    }
+
+    // ── Source 2 (structured): URL slug for the title ─────────────────────────
+    // The slug in /watch/<id>/<slug> is machine-generated and stable. Normalize to
+    // lowercase alphanumeric so "DAN DA DAN" == "dan-da-dan" (i.e. it's not just
+    // the series name repeated).
+    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const slugM = location.pathname.match(/\/watch\/[^/]+\/([^/?#]+)/i);
+    if (slugM) {
+      const slug = slugM[1];
+      const series = ldBase?.series || cleanSeriesName(
+        (document.querySelector('meta[property="og:title"]')?.content || document.title || "")
+          .replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").replace(/\s*[-–].*$/, "").trim()
+      );
+      if (series && norm(slug) !== norm(series)) {
+        const title = slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+        if (differsFromSeries(title, series)) {
+          return remember({ series, season: ldBase?.season || 1,
+                            episode: ldBase?.episode || 1, title });
+        }
+      }
+    }
+
+    // ── Source 3 (semi-structured): on-screen episode heading ─────────────────
+    // The title is rendered as "E1 – That's How Love Starts…". Anchor the search
+    // to the JSON-LD episode number so we don't grab a sidebar entry for a
+    // different episode.
+    if (ldBase) {
+      try {
+        const pageText = document.body?.innerText || "";
+        const n = ldBase.episode;
+        for (const pat of [
+          new RegExp(`(?:^|\\n)\\s*E0*${n}\\s*[-–]\\s*(.{3,100})(?=\\r?\\n|$)`, "im"),
+          new RegExp(`(?:^|\\n)\\s*Episode\\s+0*${n}\\s*[-–:]\\s*(.{3,100})(?=\\r?\\n|$)`, "im"),
+        ]) {
+          const m = pageText.match(pat);
+          if (m && differsFromSeries(m[1].trim(), ldBase.series)) {
+            return remember({ ...ldBase, title: m[1].trim() });
+          }
+        }
+      } catch {}
+    }
+
+    // ── Source 4 (fragile, LAST RESORT): parse human-readable title strings ────
+    // Only reached when every structured source above came up empty. These
+    // regexes are the historical source of the recurring naming bugs — keep them
+    // last so a structured answer always wins.
     for (const raw of [
       document.querySelector('meta[property="og:title"]')?.content || "",
       document.querySelector('meta[name="twitter:title"]')?.content || "",
       document.title,
     ]) {
       const m = parseTitleString(raw);
-      if (m && notSameAsSeries(m.title, m.series)) {
-        metaCache = m; metaCacheUrl = here; return m;
-      }
+      if (m && differsFromSeries(m.title, m.series)) return remember(m);
     }
-
-    // ── Source 2: meta[name="description"] ────────────────────────────────────
     const desc = (document.querySelector('meta[name="description"]')?.content || "").trim();
     for (const pat of [
       /Watch\s+(.+?)\s+Episode\s+(\d+)[,\s–\-]+(.+?)\s+on\s+Crunchyroll/i,
       /Watch\s+(.+?)\s*[-–]\s*Ep?\.?\s*(\d+)\s*[-–:]\s*(.+?)\s+on\s+Crunchyroll/i,
     ]) {
       const m = desc.match(pat);
-      if (m && notSameAsSeries(m[3], m[1])) {
-        const meta = { series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() };
-        metaCache = meta; metaCacheUrl = here; return meta;
-      }
-    }
-
-    // ── Source 3: JSON-LD — collect ep data even when title equals series name ─
-    let jsonLDBase = null; // { series, season, episode } — used by sources 4 & 5
-    for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
-      try {
-        const root = JSON.parse(el.textContent);
-        for (const node of [].concat(root?.["@graph"] || root)) {
-          if (!/TVEpisode|Episode/i.test(node["@type"] || "")) continue;
-          const series = (node.partOfSeries?.name || node.partOfTVSeries?.name || "").trim();
-          if (!series) continue;
-          const ldUrl = (node.url || "").trim();
-          if (ldUrl && !pathsMatch(ldUrl, here)) continue;
-          const episode = parseInt(node.episodeNumber, 10) || 1;
-          const season  = parseInt(node.partOfSeason?.seasonNumber, 10) || 1;
-          // Try cleaned title — return immediately if it's genuinely different
-          const rawTitle = (node.name || "").trim();
-          if (rawTitle) {
-            const title = cleanEpisodeTitle(rawTitle, series);
-            if (notSameAsSeries(title, series)) {
-              const meta = { series, season, episode, title };
-              metaCache = meta; metaCacheUrl = here; return meta;
-            }
-          }
-          // Title was bad but ep# / series are still useful
-          if (!jsonLDBase) jsonLDBase = { series, season, episode };
-        }
-      } catch {}
-    }
-
-    // ── Source 3b: VideoObject JSON-LD ────────────────────────────────────────
-    // Crunchyroll includes a second JSON-LD block typed "VideoObject" whose
-    // "name" field contains the clean episode title (no series prefix, no ep#).
-    if (jsonLDBase) {
-      for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
-        try {
-          const root = JSON.parse(el.textContent);
-          if (root["@type"] === "VideoObject" && root.name) {
-            const title = root.name.trim();
-            if (notSameAsSeries(title, jsonLDBase.series)) {
-              const meta = { ...jsonLDBase, title };
-              metaCache = meta; metaCacheUrl = here; return meta;
-            }
-          }
-        } catch {}
-      }
-    }
-
-    // ── Source 4: innerText scan using the ep# we got from JSON-LD ────────────
-    // The episode title is visible on screen as "E1 – That's How Love Starts…"
-    // document.body.innerText gives us every rendered line, so we search for the
-    // specific episode number to avoid matching sidebar entries for other episodes.
-    if (jsonLDBase) {
-      try {
-        const pageText = document.body?.innerText || "";
-        const n = jsonLDBase.episode;
-        for (const pat of [
-          new RegExp(`(?:^|\\n)\\s*E0*${n}\\s*[-–]\\s*(.{3,100})(?=\\r?\\n|$)`, "im"),
-          new RegExp(`(?:^|\\n)\\s*Episode\\s+0*${n}\\s*[-–:]\\s*(.{3,100})(?=\\r?\\n|$)`, "im"),
-        ]) {
-          const m = pageText.match(pat);
-          if (!m) continue;
-          const title = m[1].trim();
-          if (notSameAsSeries(title, jsonLDBase.series)) {
-            const meta = { ...jsonLDBase, title };
-            metaCache = meta; metaCacheUrl = here; return meta;
-          }
-        }
-      } catch {}
-    }
-
-    // ── Source 5: URL slug with normalized series-name comparison ──────────────
-    // Normalize to lowercase alphanumeric so "DAN DA DAN" == "dan-da-dan".
-    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const slugM = location.pathname.match(/\/watch\/[^/]+\/([^/?#]+)/i);
-    if (slugM) {
-      const slug = slugM[1];
-      const series = jsonLDBase?.series || cleanSeriesName(
-        (document.querySelector('meta[property="og:title"]')?.content || document.title || "")
-          .replace(/\s*\|\s*[^|]+$/, "").replace(/^Watch\s+/i, "").replace(/\s*[-–].*$/, "").trim()
-      );
-      if (series && norm(slug) !== norm(series)) {
-        const title = slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-        if (notSameAsSeries(title, series)) {
-          const meta = { series, season: jsonLDBase?.season || 1,
-                         episode: jsonLDBase?.episode || 1, title };
-          metaCache = meta; metaCacheUrl = here; return meta;
-        }
+      if (m && differsFromSeries(m[3], m[1])) {
+        return remember({ series: m[1].trim(), season: 1, episode: +m[2], title: m[3].trim() });
       }
     }
 
@@ -643,7 +662,7 @@
       " og:title:", document.querySelector('meta[property="og:title"]')?.content, "\n",
       " doc title:", document.title, "\n",
       " description:", (document.querySelector('meta[name="description"]')?.content || "").slice(0, 200),
-      "\n jsonLDBase:", jsonLDBase,
+      "\n ldBase:", ldBase,
     );
     return null;
   }
